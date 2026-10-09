@@ -12,7 +12,9 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 $cxx = 'g++'
-$flags = @('-O3','-std=c++17','-Wall','-Wextra')
+# -static: bake in the GCC runtime so the .exe runs without libstdc++/libgcc/
+# libwinpthread on PATH (self-contained).
+$flags = @('-O3','-std=c++17','-Wall','-Wextra','-static')
 
 Write-Host 'building nidhunt.exe (CPU)'
 & $cxx @flags -pthread src/nidhunt.cpp -o nidhunt.exe

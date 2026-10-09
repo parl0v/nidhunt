@@ -15,6 +15,9 @@ CXXFLAGS=${CXXFLAGS:-"-O3 -std=c++17 -Wall -Wextra"}
 mode=${1:-auto}
 EXE=""
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) EXE=".exe";; esac
+# On Windows/MinGW, statically link the GCC runtime so the .exe is
+# self-contained (otherwise it needs libstdc++/libgcc/libwinpthread on PATH).
+[ -n "$EXE" ] && CXXFLAGS="$CXXFLAGS -static"
 
 echo "building nidhunt${EXE} (CPU)"
 $CXX $CXXFLAGS -pthread src/nidhunt.cpp -o "nidhunt${EXE}"
