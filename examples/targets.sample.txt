@@ -1,0 +1,7 @@
+# One NID per line. Anything after the NID is a free-text annotation kept in output.
+# The first entry is the canonical self-test name; the rest are real AGC names
+# already recovered with this tool (useful as a demo target set).
+GtuZGmN-tKw	sceNpSessionSignalingCreateContext
+HV4j+E0MBHE	sceAgcCreateInterpolantMapping_0100
+23LRUSvYu1M	sceAgcInit_0090
+Ikfdt-rIqCE	sceAgcJumpPatchSetTarget_0300

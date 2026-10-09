@@ -1,0 +1,9 @@
+# Normalize line endings. Shell scripts must stay LF so they run on Linux even
+# when checked out on Windows; PowerShell/batch stay CRLF.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.h text eol=lf
+*.cpp text eol=lf
+*.py text eol=lf
+*.sh text eol=lf

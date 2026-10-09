@@ -1,0 +1,17 @@
+# Build output
+/nidhunt
+/nidhunt.exe
+/nidhunt-gpu
+/nidhunt-gpu.exe
+/build/
+*.o
+*.obj
+
+# Working data the user supplies or the tool produces — never committed.
+# (Tracked sample inputs live under examples/ and tests/, not the repo root.)
+/*.txt
+/*.log
+/*.tsv
+/*.json
+/*.csv
+hits.log
