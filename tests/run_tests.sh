@@ -44,5 +44,17 @@ else
     echo "(skip GPU tests: $GPU not built)"
 fi
 
+PY=""
+for cand in python3 python py; do
+    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import sys" >/dev/null 2>&1; then PY="$cand"; break; fi
+done
+if [ -n "$PY" ]; then
+    echo "== vocab.py =="
+    check "vocab nid" "GtuZGmN-tKw" "$PY" tools/vocab.py nid sceNpSessionSignalingCreateContext
+    check "vocab check" "OK GtuZGmN-tKw" "$PY" tools/vocab.py check sceNpSessionSignalingCreateContext GtuZGmN-tKw
+else
+    echo "(skip vocab.py tests: no python)"
+fi
+
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

@@ -8,11 +8,19 @@ Subcommands:
   nid   NAME...                 print the NID for each symbol name
   check NAME NID                exit 0 if NAME hashes to NID, else 1
   words --symbols FILE ...      extract CamelCase words to build a vocab file
+                                (--rank orders by frequency, most common first)
+  positions --symbols FILE --prefix P --out STEM
+                                per-position ranked word lists for grammar mode
 
 Examples:
   python tools/vocab.py nid sceNpSessionSignalingCreateContext
   python tools/vocab.py check sceNpSessionSignalingCreateContext GtuZGmN-tKw
-  python tools/vocab.py words --symbols known_symbols.txt --prefix sceVideoOut > vocab.txt
+  python tools/vocab.py words --symbols known_symbols.txt --prefix sceVideoOut --rank > vocab.txt
+  python tools/vocab.py positions --symbols known_symbols.txt --prefix sceVideoOut --out vo
+  #   -> vo_1.txt, vo_2.txt, ...  then:  nidhunt -t t.txt -p sceVideoOut -s vo_1.txt -s vo_2.txt
+
+Ranking by frequency, combined with nidhunt's early-exit once all targets are
+found, tries the most likely names first and stops as soon as they are hit.
 """
 import argparse
 import hashlib
@@ -38,15 +46,25 @@ def nid(name: str) -> str:
 _WORD = re.compile(r"[A-Z][a-z0-9]+|[A-Z]+(?=[A-Z]|\b|_|\d)|[A-Z]+|\d+")
 
 
-def words_from(names, prefixes):
-    out = set()
+def split_words(name, prefix):
+    """Words of `name` after `prefix`, in order (empty if prefix doesn't match)."""
+    if not name.startswith(prefix):
+        return []
+    return _WORD.findall(name[len(prefix):].split("_")[0])
+
+
+def words_from(names, prefixes, rank=False):
+    """Distinct words across names. Sorted alphabetically, or, with rank=True,
+    by descending frequency (most common first) so a search tries likely words
+    first — which, with nidhunt's early-exit, finds hits sooner."""
+    from collections import Counter
+    counts = Counter()
     for n in names:
         for pfx in prefixes:
-            if not n.startswith(pfx):
-                continue
-            rest = n[len(pfx):].split("_")[0]
-            out.update(_WORD.findall(rest))
-    return sorted(out)
+            counts.update(split_words(n, pfx))
+    if rank:
+        return [w for w, _ in counts.most_common()]
+    return sorted(counts)
 
 
 def read_symbols(paths):
@@ -86,6 +104,14 @@ def main():
     p_w = sub.add_parser("words", help="extract CamelCase words from symbol files")
     p_w.add_argument("--symbols", action="append", required=True, help="symbol list file (repeatable)")
     p_w.add_argument("--prefix", action="append", default=[], help="only names with this prefix (repeatable; default: all)")
+    p_w.add_argument("--rank", action="store_true", help="order by frequency (most common first) instead of alphabetically")
+
+    p_p = sub.add_parser("positions",
+                         help="per-position ranked word lists for grammar mode (a Markov-by-position model)")
+    p_p.add_argument("--symbols", action="append", required=True, help="symbol list file (repeatable)")
+    p_p.add_argument("--prefix", required=True, help="common prefix to strip, e.g. sceVideoOut")
+    p_p.add_argument("--out", required=True, help="output path stem; writes <stem>_1.txt, <stem>_2.txt, ...")
+    p_p.add_argument("--max-slots", type=int, default=4, help="number of positions to emit (default 4)")
 
     a = ap.parse_args()
 
@@ -104,8 +130,33 @@ def main():
         return 1
     elif a.cmd == "words":
         names = read_symbols(a.symbols)
-        for w in words_from(names, a.prefix or [""]):
+        for w in words_from(names, a.prefix or [""], rank=a.rank):
             print(w)
+    elif a.cmd == "positions":
+        from collections import Counter
+        names = read_symbols(a.symbols)
+        # Rank words by frequency at each position after the prefix: position 0
+        # is the first word, position 1 the second, and so on. This is a simple
+        # per-position (Markov-by-position) model of how names in this library
+        # are built. Feed the files to grammar mode: -s <stem>_1.txt -s ...
+        per_pos = [Counter() for _ in range(a.max_slots)]
+        for n in names:
+            ws = split_words(n, a.prefix)
+            for i, w in enumerate(ws[:a.max_slots]):
+                per_pos[i][w] += 1
+        written = 0
+        for i, counts in enumerate(per_pos):
+            if not counts:
+                break
+            path = f"{a.out}_{i + 1}.txt"
+            with open(path, "w", encoding="utf-8") as f:
+                for w, _ in counts.most_common():
+                    f.write(w + "\n")
+            print(f"wrote {path} ({len(counts)} words)", file=sys.stderr)
+            written += 1
+        if not written:
+            print(f"no symbols matched prefix {a.prefix!r}", file=sys.stderr)
+            return 1
     return 0
 
 

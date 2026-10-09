@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common.h"
@@ -146,11 +147,15 @@ std::vector<SlotPlan> build_plans(const Config& c, Corpus& corp) {
 }
 
 // Verify a candidate index against the targets on the CPU and print it.
+// Tracks which distinct target keys have been found; once every target is
+// found, all_found is set and the backends stop early.
 struct Reporter {
     const std::vector<Target>& targets;
     std::unordered_map<uint64_t, std::string> note;
+    std::unordered_set<uint64_t> found;
     std::mutex mu;
     size_t hits = 0;
+    std::atomic<bool> all_found{false};
     explicit Reporter(const std::vector<Target>& t) : targets(t) {
         for (auto& x : t) note[x.key] = x.note;
     }
@@ -162,9 +167,10 @@ struct Reporter {
         if (it == note.end()) {  // GPU produced an index that the CPU disagrees with
             std::printf("WARN %s %s  (verification mismatch)\n", nid_of_key(key).c_str(), name.c_str());
         } else {
+            if (found.insert(key).second) ++hits;  // count each distinct target once
             std::printf("HIT %s %s%s%s\n", nid_of_key(key).c_str(), name.c_str(),
                         it->second.empty() ? "" : "   ", it->second.c_str());
-            ++hits;
+            if (found.size() == note.size()) all_found.store(true, std::memory_order_relaxed);
         }
         std::fflush(stdout);
     }
@@ -173,11 +179,14 @@ struct Reporter {
 // --- CPU backend ------------------------------------------------------------
 
 // Everything a worker thread needs. Passed by pointer to the thread entry.
+// The last slot (fast = ns-1, when ns >= 2) is varied in the innermost loop;
+// the "head" of the name (prefix + all earlier slots) is built once and reused
+// across every word of the fast slot, so only the tail + hash is redone.
 struct CpuJob {
     const SlotPlan* plan;
     const std::vector<Target>* targets;
     const std::vector<uint64_t>* weight;  // radix weight per slot
-    size_t ns, pivot, pivot_n;
+    size_t ns, pivot, pivot_n, fast;      // fast = ns-1, or SIZE_MAX if ns == 1
     bool use_ni;
     Reporter* rep;
     std::atomic<size_t>* next;
@@ -198,46 +207,73 @@ static void cpu_worker(CpuJob job) {
     const SlotPlan& plan = *job.plan;
     const std::vector<Target>& targets = *job.targets;
     const std::vector<uint64_t>& weight = *job.weight;
-    const size_t ns = job.ns, pivot = job.pivot, pivot_n = job.pivot_n;
+    const size_t ns = job.ns, pivot = job.pivot, pivot_n = job.pivot_n, fast = job.fast;
     const bool use_ni = job.use_ni;
+    const size_t nt = targets.size();
     alignas(16) uint8_t buf[256];  // name + salt + SHA-1 padding, hashed in place
     const size_t plen = plan.prefix.size();
     std::memcpy(buf, plan.prefix.data(), plen);  // prefix is constant for the plan
+    std::atomic<bool>& all_found = job.rep->all_found;
+
+    // always_inline: this must fold into cpu_worker so the SHA-NI code runs on
+    // cpu_worker's force-aligned frame. A non-inlined lambda would carry none
+    // of the worker's attributes and could fault on MinGW's misaligned stack.
+    auto hash_match = [&](size_t len, uint64_t idx) __attribute__((always_inline)) {
+        if (len > MAX_NAME) return;
+        std::memcpy(buf + len, SALT, 16);
+#ifdef NIDHUNT_HAVE_SHANI
+        uint64_t key = use_ni ? sha1_first8_inplace<true>(buf, len + 16)
+                              : sha1_first8_inplace<false>(buf, len + 16);
+#else
+        uint64_t key = sha1_first8_inplace<false>(buf, len + 16);
+#endif
+        for (size_t t = 0; t < nt; ++t)
+            if (key == targets[t].key) { job.rep->report(plan, idx, use_ni); break; }
+    };
+
     std::vector<size_t> dig(ns, 0);
     for (;;) {
+        if (all_found.load(std::memory_order_relaxed)) break;  // every target found
         size_t pv = job.next->fetch_add(1);
         if (pv >= pivot_n) break;
         for (size_t j = 0; j < ns; ++j) dig[j] = 0;
         dig[pivot] = pv;
         uint64_t local = 0;
+
+        if (fast == (size_t)-1) {  // ns == 1: nothing to reuse, just hash the word
+            const std::string& word = (*plan.slots[pivot])[pv];
+            std::memcpy(buf + plen, word.data(), word.size());
+            hash_match(plen + word.size(), (uint64_t)pv * weight[pivot]);
+            *job.done += 1;
+            continue;
+        }
+
+        const std::vector<std::string>& fastwords = *plan.slots[fast];
+        const size_t fastn = fastwords.size();
         for (;;) {
-            size_t len = plen;
-            for (size_t j = 0; j < ns && len <= MAX_NAME; ++j) {
+            // Build the head (prefix + every slot except the fast one) once, then
+            // reuse it across all fast-slot words.
+            size_t head = plen;
+            uint64_t head_idx = 0;
+            for (size_t j = 0; j < fast; ++j) {
                 const std::string& word = (*plan.slots[j])[dig[j]];
-                std::memcpy(buf + len, word.data(), word.size());
-                len += word.size();
+                std::memcpy(buf + head, word.data(), word.size());
+                head += word.size();
+                head_idx += (uint64_t)dig[j] * weight[j];
             }
-            if (len <= MAX_NAME) {
-                std::memcpy(buf + len, SALT, 16);
-#ifdef NIDHUNT_HAVE_SHANI
-                uint64_t key = use_ni ? sha1_first8_inplace<true>(buf, len + 16)
-                                      : sha1_first8_inplace<false>(buf, len + 16);
-#else
-                uint64_t key = sha1_first8_inplace<false>(buf, len + 16);
-#endif
-                for (auto& t : targets) {
-                    if (key == t.key) {
-                        uint64_t idx = 0;
-                        for (size_t j = 0; j < ns; ++j) idx += (uint64_t)dig[j] * weight[j];
-                        job.rep->report(plan, idx, job.use_ni);
-                    }
+            if (head <= MAX_NAME) {
+                for (size_t fd = 0; fd < fastn; ++fd) {
+                    const std::string& fw = fastwords[fd];
+                    std::memcpy(buf + head, fw.data(), fw.size());
+                    hash_match(head + fw.size(), head_idx + (uint64_t)fd * weight[fast]);
                 }
             }
-            ++local;
-            // Odometer over every slot except the pivot.
+            local += fastn;
+            if (all_found.load(std::memory_order_relaxed)) break;
+            // Odometer over every slot except the pivot and the fast slot.
             size_t pos = 0;
             while (pos < ns) {
-                if (pos == pivot) { ++pos; continue; }
+                if (pos == pivot || pos == fast) { ++pos; continue; }
                 if (++dig[pos] < plan.slots[pos]->size()) break;
                 dig[pos] = 0; ++pos;
             }
@@ -251,9 +287,12 @@ void hash_plan_cpu(const SlotPlan& plan, const std::vector<Target>& targets, int
                    bool use_ni, Reporter& rep, std::atomic<uint64_t>& done) {
     size_t ns = plan.slots.size();
     if (ns == 0) return;
-    // Parallelize over the largest slot for even load balancing.
+    // Vary the last slot innermost (fast); parallelize over the largest of the
+    // remaining slots for load balance. With one slot there is no head to reuse.
+    size_t fast = ns >= 2 ? ns - 1 : (size_t)-1;
     size_t pivot = 0;
-    for (size_t j = 1; j < ns; ++j)
+    size_t pivot_hi = (ns >= 2) ? ns - 1 : ns;  // candidates for pivot: [0, pivot_hi)
+    for (size_t j = 1; j < pivot_hi; ++j)
         if (plan.slots[j]->size() > plan.slots[pivot]->size()) pivot = j;
     size_t pivot_n = plan.slots[pivot]->size();
 
@@ -264,7 +303,7 @@ void hash_plan_cpu(const SlotPlan& plan, const std::vector<Target>& targets, int
     for (size_t j = 0; j < ns; ++j) { weight[j] = w; w *= (uint64_t)plan.slots[j]->size(); }
 
     std::atomic<size_t> next{0};
-    CpuJob job{&plan, &targets, &weight, ns, pivot, pivot_n, use_ni, &rep, &next, &done};
+    CpuJob job{&plan, &targets, &weight, ns, pivot, pivot_n, fast, use_ni, &rep, &next, &done};
     std::vector<std::thread> pool;
     for (int i = 0; i < threads; ++i) pool.emplace_back(cpu_worker, job);
     for (auto& t : pool) t.join();
@@ -389,7 +428,10 @@ void hash_plan_gpu(GpuCtx& g, const SlotPlan& plan, const std::vector<Target>& t
         size_t gsz = (size_t)((n + 255) / 256 * 256);
         CK(clEnqueueNDRangeKernel(g.q, kern, 1, nullptr, &gsz, nullptr, 0, nullptr, nullptr));
         done += n;
-        if (++pending >= INFLIGHT) drain();
+        if (++pending >= INFLIGHT) {
+            drain();
+            if (rep.all_found.load(std::memory_order_relaxed)) return;  // every target found
+        }
     }
     if (pending) drain();
     // Buffers are intentionally not released: some ICDs (notably NVIDIA on
@@ -466,6 +508,7 @@ int main(int argc, char** argv) {
     std::atomic<uint64_t> done{0};
     auto t0 = std::chrono::steady_clock::now();
     for (auto& p : plans) {
+        if (rep.all_found.load(std::memory_order_relaxed)) break;  // all targets found
 #ifdef NIDHUNT_OPENCL
         if (want_gpu) { hash_plan_gpu(gpu, p, targets, rep, done); continue; }
 #endif

@@ -38,5 +38,19 @@ if (Test-Path $gpu) {
     Write-Host "(skip GPU tests: $gpu not built)"
 }
 
+$py = $null
+foreach ($cand in @('python3','python','py')) {
+    if (Get-Command $cand -ErrorAction SilentlyContinue) {
+        try { & $cand -c "import sys" 2>$null; if ($LASTEXITCODE -eq 0) { $py = $cand; break } } catch {}
+    }
+}
+if ($py) {
+    Write-Host '== vocab.py =='
+    Check 'vocab nid' 'GtuZGmN-tKw' $py @('tools/vocab.py','nid','sceNpSessionSignalingCreateContext')
+    Check 'vocab check' 'OK GtuZGmN-tKw' $py @('tools/vocab.py','check','sceNpSessionSignalingCreateContext','GtuZGmN-tKw')
+} else {
+    Write-Host '(skip vocab.py tests: no working python)'
+}
+
 Write-Host "== $($script:pass) passed, $($script:fail) failed =="
 if ($script:fail -ne 0) { exit 1 }

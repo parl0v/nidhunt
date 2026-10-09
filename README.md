@@ -171,11 +171,14 @@ already know (for the same library you are attacking), to seed a vocabulary:
 
 ```bash
 python tools/vocab.py words --symbols known_symbols.txt --prefix sceVideoOut > vocab.txt
+python tools/vocab.py words --symbols known_symbols.txt --prefix sceVideoOut --rank > vocab.txt  # frequency-ordered
+python tools/vocab.py positions --symbols known_symbols.txt --prefix sceVideoOut --out vo        # vo_1.txt, vo_2.txt, ...
 ```
 
 It accepts plain names, `'name': '...'`-style lines, or `<nid> <name>` lines, so
 you can point it at exports you have already mapped. It bundles no data of its
-own.
+own. `--rank` and `positions` order the output so likely names are tried first;
+see [Smarter searching](#smarter-searching).
 
 ## Performance
 
@@ -183,23 +186,33 @@ Measured on an i5-14400F (16 threads) and an RTX 4060:
 
 | backend | throughput |
 |---|---|
-| GPU (`nidhunt-gpu --backend gpu`, RTX 4060, OpenCL) | ~1.8–2.7 G names/s |
-| CPU (`nidhunt`, SHA-NI, 16 threads) | ~0.2 G names/s |
+| GPU (`nidhunt-gpu --backend gpu`, RTX 4060, OpenCL) | ~3.4–4.0 G names/s |
+| CPU (`nidhunt`, SHA-NI, 16 threads) | ~0.3 G names/s |
 | CPU (portable scalar fallback, no SHA-NI) | ~50 M names/s |
 
 Throughput depends on the candidate shape: names that fit one 64-byte SHA-1
-block (≤ 39 characters, the common case) hash at roughly double the rate of
-longer names that need two, and more slots mean more mixed-radix divisions per
-candidate on the GPU.
+block (≤ 39 characters, the common case) hash faster than longer names that need
+two blocks.
 
 The CPU backend uses the x86 **SHA-NI** instructions when the CPU has them
 (detected at run time) and falls back to a portable scalar SHA-1 otherwise, so
 it builds and runs on any target.
 
-The hot paths already apply the cheap wins: the GPU keeps its per-slot lookup
-tables in constant memory, skips the divide on the final slot, and zeroes only
-the SHA-1 padding gap; the CPU hashes in place (no per-candidate message copy)
-and realigns/​de-vectorizes the worker so SHA-NI runs safely on MinGW threads.
+The hot paths are tuned:
+
+* **GPU** generates a kernel specialized to each plan shape with the slot counts
+  baked in as literals — the slot loop unrolls and every mixed-radix divide
+  becomes a constant-division magic multiply. Several batches stay in flight
+  before a sync to hide read-back latency (bounded so no GPU-busy window trips
+  the Windows watchdog).
+* **CPU** hashes in place (no per-candidate message copy), reuses the invariant
+  head of the name across the innermost slot (only the tail + hash is redone),
+  and force-aligns / de-vectorizes the worker so SHA-NI runs safely on MinGW
+  threads.
+* **Both** stop as soon as every target NID has been found, so searching for a
+  handful of NIDs finishes the moment they turn up instead of scanning the whole
+  space. Order the vocabulary with `tools/vocab.py ... --rank` to try the most
+  likely names first and hit that early-exit sooner.
 
 ### Search-space sizing
 
@@ -215,27 +228,30 @@ space. Deriving the vocabulary from known symbols in the *same* library (via
 `tools/vocab.py words`) is usually far more productive than a bigger generic
 list.
 
-### Ideas for going faster / smarter
+### Smarter searching
 
-These are deliberately not implemented yet; the current code favours one clear,
-general code path over peak speed. Rough expected gains:
+Beyond raw throughput, shrink and reorder the space so the names you want turn
+up first (and the early-exit ends the run):
 
-* **Specialize the hot loop per fixed depth.** The generic per-slot indirection
-  (pointer-chase into each slot's word list every candidate) costs maybe 1.5× on
-  both backends versus a shape fixed at compile time. Emit a specialized kernel
-  for the common depths.
-* **Reuse the invariant head of the name.** Across one odometer sweep only the
-  last slot changes; rebuilding just the tail (and re-running only the final
-  SHA-1 block) avoids redundant work for long names.
-* **Overlap GPU batches.** The GPU currently reads the hit counter back after
-  every batch, stalling the pipeline. Double-buffering the hit buffer and only
-  reading it when the atomic counter is non-zero would hide that latency.
-* **Smarter candidate order.** Weight words by their frequency in known symbols
-  and enumerate high-probability names first; mine affix statistics (common
-  prefixes, verb/object pairings, version-suffix patterns) from an existing
-  symbol set to shrink the realistic space.
-* **Markov / learned word models.** Score candidate names by a model trained on
-  known PS5 symbol names and cut off low-probability branches early.
+* **Order by frequency.** `tools/vocab.py words --symbols known.txt --prefix P
+  --rank` emits the vocabulary most-common-word-first, learned from symbols you
+  already know in the same library.
+* **Per-position (Markov-by-position) grammar.** `tools/vocab.py positions
+  --symbols known.txt --prefix P --out vo` writes `vo_1.txt`, `vo_2.txt`, … —
+  each position's words ranked by how often they appear *there*. Feed them to
+  grammar mode (`-s vo_1.txt -s vo_2.txt …`) to enumerate the realistic names
+  for that library first.
+* **Keep the space tight.** Lean on `--prefix` and grammar mode; a vocabulary
+  derived from the same library beats a bigger generic list.
+
+### Further ideas (not implemented)
+
+* A full word-level Markov model with best-first enumeration (priority queue)
+  rather than dense index order — higher hit-rate per candidate, but it gives up
+  the GPU's dense-index parallelism, so it suits a CPU pre-pass.
+* SHA-1 midstate reuse for names longer than one block (precompute the hash of
+  the invariant leading block). PS5 names are usually one block, so the payoff
+  is small today.
 
 ## Contributing recovered names
 
