@@ -125,6 +125,7 @@ nidhunt -t targets.txt -p sce -s verbs.txt -s objects.txt -S suffixes.txt
 | `--backend cpu\|gpu\|auto` | default `auto` (GPU if built and present, else CPU) |
 | `--threads N` | CPU worker threads (default: all cores) |
 | `--device N` | OpenCL GPU index to use (see `--list-devices`; default 0) |
+| `--part K/N` | run only shard K of N of the search space (GPU) — split a long run into resumable chunks |
 | `--self-test` | verify the hashing against the known NID and exit |
 | `--list-devices` | list OpenCL GPUs and exit |
 | `-h, --help` | usage |

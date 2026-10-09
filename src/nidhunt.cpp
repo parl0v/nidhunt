@@ -86,6 +86,7 @@ struct Config {
     int depth = 0;
     int threads = 0;
     int device = -1;  // OpenCL GPU index, -1 = first
+    int part = 0, parts = 0;  // --part K/N: run only shard K of N (for resumable runs)
     bool self_test = false, list_devices = false, help = false, version = false;
 };
 
@@ -175,6 +176,7 @@ void usage(const char* prog) {
         "      --backend B      cpu | gpu | auto   (default auto)\n"
         "      --threads N      CPU worker threads (default: all cores)\n"
         "      --device N       OpenCL GPU index to use (see --list-devices; default 0)\n"
+        "      --part K/N       run only shard K of N of the search (GPU; for resumable runs)\n"
         "      --self-test      verify the hashing against a known NID and exit\n"
         "      --list-devices   list OpenCL GPUs and exit\n"
         "      --version        print version, author, and license, then exit\n"
@@ -203,6 +205,9 @@ bool parse_args(int argc, char** argv, Config& c) {
         else if (a == "--backend") c.backend = val("--backend");
         else if (a == "--threads") c.threads = std::atoi(val("--threads").c_str());
         else if (a == "--device") c.device = std::atoi(val("--device").c_str());
+        else if (a == "--part") { std::string v = val("--part"); size_t s = v.find('/');
+            if (s == std::string::npos) { std::fprintf(stderr, "--part wants K/N, e.g. 3/12\n"); std::exit(1); }
+            c.part = std::atoi(v.substr(0, s).c_str()); c.parts = std::atoi(v.substr(s + 1).c_str()); }
         else if (a == "--self-test") c.self_test = true;
         else if (a == "--list-devices") c.list_devices = true;
         else if (a == "--version") c.version = true;
@@ -572,8 +577,10 @@ cl_kernel gpu_kernel_for(GpuCtx& g, const std::string& src) {
     return k;
 }
 
+// Enumerates plan candidate indices [lo, hi) (hi == 0 means the whole plan).
+// A sub-range lets --part shard a plan across runs for resumable work.
 void hash_plan_gpu(GpuCtx& g, const SlotPlan& plan, const std::vector<Target>& targets,
-                   Reporter& rep, std::atomic<uint64_t>& done) {
+                   Reporter& rep, std::atomic<uint64_t>& done, uint64_t lo = 0, uint64_t hi = 0) {
     // Flatten every slot's words into one pool; each slot is [start, start+count).
     std::vector<uint8_t> wchars; std::vector<uint32_t> woff; std::vector<uint8_t> wlen;
     std::vector<std::pair<uint32_t, uint32_t>> slotsig;  // {count, start} per slot
@@ -640,8 +647,9 @@ void hash_plan_gpu(GpuCtx& g, const SlotPlan& plan, const std::vector<Target>& t
         }
         pending = 0;
     };
-    for (uint64_t base = 0; base < total; base += BATCH) {
-        uint64_t n = total - base < BATCH ? total - base : BATCH;
+    if (hi == 0 || hi > total) hi = total;
+    for (uint64_t base = lo; base < hi; base += BATCH) {
+        uint64_t n = hi - base < BATCH ? hi - base : BATCH;
         CK(clSetKernelArg(kern, 4, 8, &base));
         size_t gsz = (size_t)((n + 255) / 256 * 256);
         CK(clEnqueueNDRangeKernel(g.q, kern, 1, nullptr, &gsz, nullptr, 0, nullptr, nullptr));
@@ -742,12 +750,24 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> target_key_vec(target_keys.begin(), target_keys.end());
     std::sort(target_key_vec.begin(), target_key_vec.end());  // for the CPU binary search
 
+    // --part K/N: run only shard K of N (contiguous slices of the global space),
+    // so a long search can be split into resumable chunks. GPU-only for now.
+    uint64_t shard_lo = 0, shard_hi = grand;
+    if (c.parts > 0) {
+        if (c.part < 1 || c.part > c.parts) { std::fprintf(stderr, "nidhunt: --part K must be 1..N\n"); return 1; }
+        if (!want_gpu) { std::fprintf(stderr, "nidhunt: --part currently requires --backend gpu\n"); return 1; }
+        shard_lo = (uint64_t)((__int128)grand * (c.part - 1) / c.parts);
+        shard_hi = (uint64_t)((__int128)grand * c.part / c.parts);
+    }
+    uint64_t run_total = shard_hi - shard_lo;
+
     std::string label;
 #ifdef NIDHUNT_OPENCL
     if (want_gpu) label = std::string("GPU ") + dname;
 #endif
     if (label.empty())
         label = (use_ni ? "CPU SHA-NI x" : "CPU scalar x") + std::to_string(threads);
+    if (c.parts > 0) { char pb[32]; std::snprintf(pb, sizeof pb, "  part %d/%d", c.part, c.parts); label += pb; }
 
     // Banner (stderr).
     std::fprintf(stderr, "%s%snidhunt%s  %s%s%s\n",
@@ -756,19 +776,27 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%stargets%s %zu   %splans%s %zu   %sspace%s %s candidates\n\n",
                  ui.e(ansi::GRY).c_str(), ui.e(ansi::RST).c_str(), ntargets,
                  ui.e(ansi::GRY).c_str(), ui.e(ansi::RST).c_str(), plans.size(),
-                 ui.e(ansi::GRY).c_str(), ui.e(ansi::RST).c_str(), human_count((double)grand).c_str());
+                 ui.e(ansi::GRY).c_str(), ui.e(ansi::RST).c_str(), human_count((double)run_total).c_str());
 
     Reporter rep(targets);
     rep.ui = &ui;
     std::atomic<uint64_t> done{0};
     auto t0 = std::chrono::steady_clock::now();
-    Progress prog(done, grand, rep, ui, t0, (int)plans.size());
+    Progress prog(done, run_total, rep, ui, t0, (int)plans.size());
     prog.start();
+    uint64_t off = 0;  // running global index at the start of each plan
     for (size_t pi = 0; pi < plans.size(); ++pi) {
         if (rep.all_found.load(std::memory_order_relaxed)) break;  // all targets found
         prog.plan_idx.store((int)pi, std::memory_order_relaxed);
+        uint64_t cnt = plans[pi].count();
+        uint64_t p_lo = off, p_hi = off + cnt;
+        off = p_hi;
+        // Intersect this plan's global range with the requested shard.
+        uint64_t a = p_lo > shard_lo ? p_lo : shard_lo;
+        uint64_t b = p_hi < shard_hi ? p_hi : shard_hi;
+        if (a >= b) continue;  // this plan is outside the shard
 #ifdef NIDHUNT_OPENCL
-        if (want_gpu) { hash_plan_gpu(gpu, plans[pi], targets, rep, done); continue; }
+        if (want_gpu) { hash_plan_gpu(gpu, plans[pi], targets, rep, done, a - p_lo, b - p_lo); continue; }
 #endif
         hash_plan_cpu(plans[pi], target_key_vec, threads, use_ni, rep, done);
     }
