@@ -1,0 +1,17 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (CPU; GPU too if an OpenCL loader is present)
+        run: ./build.sh
+      - name: Self-test
+        run: ./nidhunt --self-test
+      - name: Test suite
+        run: ./tests/run_tests.sh

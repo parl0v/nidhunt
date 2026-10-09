@@ -1,5 +1,7 @@
 # nidhunt
 
+[![ci](https://github.com/parl0v/nidhunt/actions/workflows/ci.yml/badge.svg)](https://github.com/parl0v/nidhunt/actions/workflows/ci.yml)
+
 Recover PlayStation 5 system-library symbol **names** from their **NID** hashes,
 for open-source emulator and homebrew work.
 
@@ -197,7 +199,9 @@ see [Smarter searching](#smarter-searching).
 
 ## Performance
 
-Measured on an i5-14400F (16 threads) and an RTX 4060:
+Measured on an i5-14400F (16 threads) and an RTX 4060 (driver 616.56), on a
+depth-3 combinator over a ~2,200-word vocabulary with an `sceVideoOut` prefix
+(realistic one-block names), no targets hit:
 
 | backend | throughput |
 |---|---|
@@ -279,6 +283,13 @@ contribution process. Only submit names you have verified, and remember a
 hash match is a *candidate*: a name can collide or simply be the wrong spelling
 of the real one, so sanity-check it against the surrounding API before relying
 on it.
+
+A NID is a 64-bit truncated hash, so collisions are possible but rare: a random
+name matches a given NID with probability ≈ 1 / 2⁶⁴. Over a large run — say
+10¹³ candidates against 40 target NIDs — the expected number of *spurious*
+matches is about `1e13 × 40 / 2⁶⁴ ≈ 0.002%`. In practice a hit is almost
+certainly the real name, but a plausible, API-consistent spelling is the real
+confirmation.
 
 ## License
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // nidhunt - recover PS5 symbol names from their NID hashes by generating and
 // hash-checking candidate names. See README.md for background and usage.
 //

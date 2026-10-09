@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // SHA-1 compression used by nidhunt.
 //
 // Two implementations of the 64-byte block transform:
