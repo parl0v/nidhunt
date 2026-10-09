@@ -29,30 +29,36 @@ void sha1_block(uint* h, const uint* m) {
     h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
 }
 
+// slotStart/slotCount live in __constant memory: they are read on every slot
+// of every work item, and constant memory is broadcast-cached, far cheaper than
+// the per-item __global reads this used to do (the main GPU regression). The
+// bulk word pool stays __global.
 __kernel void crack(__global const uchar* wchars, __global const uint* woff, __global const uchar* wlen,
-                    __global const uint* slotStart, __global const uint* slotCount, uint nslots,
+                    __constant uint* slotStart, __constant uint* slotCount, uint nslots,
                     __constant uchar* prefix, uint plen, ulong base, ulong total,
                     __constant ulong* targets, uint ntargets, __global ulong* hits, __global uint* nhits) {
     ulong gid = base + get_global_id(0);
     if (gid >= total) return;
     uchar buf[128];
-    for (int i = 0; i < 128; ++i) buf[i] = 0;
     uint len = 0;
     for (uint i = 0; i < plen && len < 100; ++i) buf[len++] = prefix[i];
     ulong idx = gid;
     for (uint j = 0; j < nslots; ++j) {
-        uint cnt = slotCount[j];
-        uint d = (uint)(idx % cnt); idx /= cnt;
+        // Last slot needs no divide: idx < slotCount[last] is guaranteed, so
+        // the digit is just idx. Non-power-of-2 division is costly on GPU.
+        uint d = (j + 1 == nslots) ? (uint)idx : (uint)(idx % slotCount[j]);
+        if (j + 1 != nslots) idx /= slotCount[j];
         uint wi = slotStart[j] + d;
         uint o = woff[wi], l = wlen[wi];
         for (uint i = 0; i < l && len < 100; ++i) buf[len++] = wchars[o + i];
     }
     for (int i = 0; i < 16; ++i) buf[len + i] = SALT[i];
     uint L = len + 16;
-    buf[L] = 0x80;
     uint nb = (L + 9 <= 64) ? 1 : 2;
-    ulong bits = (ulong)L * 8;
     uint end = nb * 64;
+    buf[L] = 0x80;
+    for (uint i = L + 1; i < end - 8; ++i) buf[i] = 0;  // zero only the padding gap
+    ulong bits = (ulong)L * 8;
     for (int i = 0; i < 8; ++i) buf[end - 1 - i] = (uchar)(bits >> (8 * i));
     uint h[5] = {0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u};
     uint m[16];

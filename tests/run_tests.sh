@@ -30,11 +30,16 @@ check "cpu combinator" "HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext" \
 # Grammar: single slot holding whole candidate names.
 check "cpu grammar" "HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext" \
     "$CPU" -t tests/targets_selftest.txt -s tests/slot_selftest.txt
+# Suffix: recover a real suffixed name (prefix + word slot + suffix slot).
+check "cpu suffix" "HIT 23LRUSvYu1M sceAgcInit_0090" \
+    "$CPU" -t tests/targets_suffix.txt -p sceAgc -s tests/vocab_suffix.txt -S tests/suffixes_suffix.txt
 
 if [ -x "$GPU" ]; then
     echo "== GPU recovery =="
     check "gpu combinator" "HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext" \
         "$GPU" --backend gpu -t tests/targets_selftest.txt -p sceNp -v tests/vocab_selftest.txt -d 4
+    check "gpu suffix" "HIT 23LRUSvYu1M sceAgcInit_0090" \
+        "$GPU" --backend gpu -t tests/targets_suffix.txt -p sceAgc -s tests/vocab_suffix.txt -S tests/suffixes_suffix.txt
 else
     echo "(skip GPU tests: $GPU not built)"
 fi

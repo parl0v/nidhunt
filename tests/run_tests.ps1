@@ -25,11 +25,15 @@ Check 'cpu combinator' 'HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext' $cpu
     @('-t','tests/targets_selftest.txt','-p','sceNp','-v','tests/vocab_selftest.txt','-d','4')
 Check 'cpu grammar' 'HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext' $cpu `
     @('-t','tests/targets_selftest.txt','-s','tests/slot_selftest.txt')
+Check 'cpu suffix' 'HIT 23LRUSvYu1M sceAgcInit_0090' $cpu `
+    @('-t','tests/targets_suffix.txt','-p','sceAgc','-s','tests/vocab_suffix.txt','-S','tests/suffixes_suffix.txt')
 
 if (Test-Path $gpu) {
     Write-Host '== GPU recovery =='
     Check 'gpu combinator' 'HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext' $gpu `
         @('--backend','gpu','-t','tests/targets_selftest.txt','-p','sceNp','-v','tests/vocab_selftest.txt','-d','4')
+    Check 'gpu suffix' 'HIT 23LRUSvYu1M sceAgcInit_0090' $gpu `
+        @('--backend','gpu','-t','tests/targets_suffix.txt','-p','sceAgc','-s','tests/vocab_suffix.txt','-S','tests/suffixes_suffix.txt')
 } else {
     Write-Host "(skip GPU tests: $gpu not built)"
 }

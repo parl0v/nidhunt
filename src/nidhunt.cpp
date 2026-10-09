@@ -184,20 +184,23 @@ struct CpuJob {
     std::atomic<uint64_t>* done;
 };
 
-// force_align_arg_pointer: realign this frame to 16 bytes on entry. MinGW's
-// std::thread starts workers on a stack that is not 16-byte aligned, and at
-// -O2+ GCC vectorizes this function's stack buffer with *aligned* SSE stores
-// (and the SHA-NI path spills aligned too). Realigning the worker's own frame
-// fixes both, and keeps the tool correct when built with a plain `g++` (no
-// special flags). The main thread is ABI-aligned, so the GPU path needs none.
-__attribute__((force_align_arg_pointer))
+// MinGW starts std::thread workers on a stack that is not 16-byte aligned, so
+// the aligned SSE that GCC emits at -O2+ (auto-vectorized buffer stores, plus
+// register spills on the SHA-NI path) faults and crashes the worker. Two
+// defenses, together, make it reliable without any special build flags:
+//   * force_align_arg_pointer realigns this frame to 16 bytes on entry, so this
+//     function and everything it calls run on an aligned stack;
+//   * no-tree-vectorize drops the aligned vectorized stores entirely.
+// The SHA-1 is hand-written intrinsics, so neither costs throughput. The main
+// thread is ABI-aligned, so the GPU path needs none of this.
+__attribute__((force_align_arg_pointer, optimize("no-tree-vectorize", "no-tree-slp-vectorize")))
 static void cpu_worker(CpuJob job) {
     const SlotPlan& plan = *job.plan;
     const std::vector<Target>& targets = *job.targets;
     const std::vector<uint64_t>& weight = *job.weight;
     const size_t ns = job.ns, pivot = job.pivot, pivot_n = job.pivot_n;
     const bool use_ni = job.use_ni;
-    uint8_t buf[256], pad[192];
+    alignas(16) uint8_t buf[256];  // name + salt + SHA-1 padding, hashed in place
     const size_t plen = plan.prefix.size();
     std::memcpy(buf, plan.prefix.data(), plen);  // prefix is constant for the plan
     std::vector<size_t> dig(ns, 0);
@@ -217,10 +220,10 @@ static void cpu_worker(CpuJob job) {
             if (len <= MAX_NAME) {
                 std::memcpy(buf + len, SALT, 16);
 #ifdef NIDHUNT_HAVE_SHANI
-                uint64_t key = use_ni ? sha1_first8_into<true>(pad, buf, len + 16)
-                                      : sha1_first8_into<false>(pad, buf, len + 16);
+                uint64_t key = use_ni ? sha1_first8_inplace<true>(buf, len + 16)
+                                      : sha1_first8_inplace<false>(buf, len + 16);
 #else
-                uint64_t key = sha1_first8_into<false>(pad, buf, len + 16);
+                uint64_t key = sha1_first8_inplace<false>(buf, len + 16);
 #endif
                 for (auto& t : targets) {
                     if (key == t.key) {

@@ -123,6 +123,28 @@ inline uint64_t sha1_first8_into(uint8_t* buf, const uint8_t* msg, size_t len) {
     return (uint64_t)h[0] << 32 | h[1];
 }
 
+// Hash msg[0..len) in place and return the first 8 digest bytes big-endian.
+// The caller's buffer must have room for the SHA-1 padding: at least
+// round_up(len + 9, 64) bytes (<= len + 72). Avoids the message copy that
+// sha1_first8_into does, so it is the hot-path entry for the CPU backend.
+template <bool UseNI>
+inline uint64_t sha1_first8_inplace(uint8_t* buf, size_t len) {
+    uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+    size_t padlen = ((len + 9 + 63) / 64) * 64;
+    buf[len] = 0x80;
+    std::memset(buf + len + 1, 0, padlen - len - 9);
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; ++i) buf[padlen - 1 - i] = (uint8_t)(bits >> (8 * i));
+    for (size_t off = 0; off < padlen; off += 64) {
+#ifdef NIDHUNT_HAVE_SHANI
+        if (UseNI) sha1_block_ni(h, buf + off); else sha1_block_scalar(h, buf + off);
+#else
+        sha1_block_scalar(h, buf + off);
+#endif
+    }
+    return (uint64_t)h[0] << 32 | h[1];
+}
+
 // Convenience wrapper with an internal scratch buffer (used off the hot path).
 inline uint64_t sha1_first8(const uint8_t* msg, size_t len, bool use_ni) {
     uint8_t buf[256];

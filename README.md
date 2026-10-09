@@ -179,18 +179,27 @@ own.
 
 ## Performance
 
-Measured on a Ryzen-class desktop CPU (16 threads) and an RTX 4060, SHA-1 with a
-single salted block per candidate:
+Measured on an i5-14400F (16 threads) and an RTX 4060:
 
 | backend | throughput |
 |---|---|
-| GPU (`nidhunt-gpu --backend gpu`, RTX 4060, OpenCL) | ~1.1 G names/s |
-| CPU (`nidhunt`, SHA-NI, 16 threads) | ~165 M names/s |
+| GPU (`nidhunt-gpu --backend gpu`, RTX 4060, OpenCL) | ~1.8–2.7 G names/s |
+| CPU (`nidhunt`, SHA-NI, 16 threads) | ~0.2 G names/s |
 | CPU (portable scalar fallback, no SHA-NI) | ~50 M names/s |
+
+Throughput depends on the candidate shape: names that fit one 64-byte SHA-1
+block (≤ 39 characters, the common case) hash at roughly double the rate of
+longer names that need two, and more slots mean more mixed-radix divisions per
+candidate on the GPU.
 
 The CPU backend uses the x86 **SHA-NI** instructions when the CPU has them
 (detected at run time) and falls back to a portable scalar SHA-1 otherwise, so
 it builds and runs on any target.
+
+The hot paths already apply the cheap wins: the GPU keeps its per-slot lookup
+tables in constant memory, skips the divide on the final slot, and zeroes only
+the SHA-1 padding gap; the CPU hashes in place (no per-candidate message copy)
+and realigns/​de-vectorizes the worker so SHA-NI runs safely on MinGW threads.
 
 ### Search-space sizing
 
