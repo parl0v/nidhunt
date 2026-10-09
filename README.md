@@ -17,7 +17,9 @@ nidhunt generates candidate names from word lists and checks their hashes
 against a set of target NIDs. A match is **hash-verified**: the recovered name
 provably hashes to the target, so names found this way can be contributed back
 to those projects with confidence. Names recovered with this approach have been
-accepted into those projects' review queues (AnyPS5 #2319, sce_symbols #22).
+submitted to those projects' review queues
+([AnyPS5 #2319](https://github.com/boykopovar/AnyPS5/pull/2319),
+[sce_symbols #22](https://github.com/zecoxao/sce_symbols/pull/22)).
 
 nidhunt only hashes **function names**. It does not touch keys, passwords, or
 copy protection, and ships with no symbol data — you supply your own word lists
