@@ -10,8 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build (CPU; GPU too if an OpenCL loader is present)
-        run: ./build.sh
+        run: bash build.sh
       - name: Self-test
         run: ./nidhunt --self-test
       - name: Test suite
-        run: ./tests/run_tests.sh
+        run: bash tests/run_tests.sh
