@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Josip Parlov (parl0v)
 """nidhunt helper: build vocabularies and verify NIDs.
 
 This is the reference implementation of the PS5 NID hash and a few conveniences

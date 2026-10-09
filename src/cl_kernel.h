@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Josip Parlov (parl0v)
 // OpenCL kernel generator for the GPU backend. One work item per candidate.
 //
 // The kernel is generated per plan shape with the slot counts and starts baked

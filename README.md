@@ -295,7 +295,10 @@ confirmation.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Copyright © 2026 Josip Parlov ([@parl0v](https://github.com/parl0v)).
+Licensed under **GPL-3.0-or-later** — see [LICENSE](LICENSE). Redistributions,
+including modified versions, must keep this copyright and license notice and
+make source available under the same license.
 
 The OpenCL headers bundled under `src/CL/` are from the Khronos Group and are
 distributed under their own Apache-2.0 license (see the notices in those files);

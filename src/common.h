@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Josip Parlov (parl0v)
 // Shared definitions for nidhunt: the PS5 NID codec, input parsing, and the
 // slot-plan candidate model that both the CPU and GPU backends enumerate.
 //
