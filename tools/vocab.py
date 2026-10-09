@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Josip Parlov (parl0v)
+# Additional term (GPL-3.0 section 7b): conveyed or modified versions must preserve the author attribution "nidhunt by Josip Parlov (parl0v)" in their Appropriate Legal Notices (this CLI shows it in --version).
 """nidhunt helper: build vocabularies and verify NIDs.
 
 This is the reference implementation of the PS5 NID hash and a few conveniences

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Josip Parlov (parl0v)
+// Additional term (GPL-3.0 section 7b): conveyed or modified versions must preserve the author attribution "nidhunt by Josip Parlov (parl0v)" in their Appropriate Legal Notices (this CLI shows it in --version).
 // OpenCL kernel generator for the GPU backend. One work item per candidate.
 //
 // The kernel is generated per plan shape with the slot counts and starts baked

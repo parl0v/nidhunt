@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Josip Parlov (parl0v)
+// Additional term (GPL-3.0 section 7b): conveyed or modified versions must preserve the author attribution "nidhunt by Josip Parlov (parl0v)" in their Appropriate Legal Notices (this CLI shows it in --version).
 // Shared definitions for nidhunt: the PS5 NID codec, input parsing, and the
 // slot-plan candidate model that both the CPU and GPU backends enumerate.
 //

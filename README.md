@@ -300,6 +300,11 @@ Licensed under **GPL-3.0-or-later** — see [LICENSE](LICENSE). Redistributions,
 including modified versions, must keep this copyright and license notice and
 make source available under the same license.
 
+**Additional term under GPL-3.0 section 7(b):** if you convey this program or a
+modified version of it, you must preserve the author attribution
+*"nidhunt by Josip Parlov (parl0v)"* in its Appropriate Legal Notices. For this
+command-line program, that notice is the `--version` output.
+
 The OpenCL headers bundled under `src/CL/` are from the Khronos Group and are
 distributed under their own Apache-2.0 license (see the notices in those files);
 they are included only to make the GPU build self-contained.

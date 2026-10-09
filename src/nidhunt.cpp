@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Josip Parlov (parl0v)
+// Additional term (GPL-3.0 section 7b): conveyed or modified versions must preserve the author attribution "nidhunt by Josip Parlov (parl0v)" in their Appropriate Legal Notices (this CLI shows it in --version).
 // nidhunt - recover PS5 symbol names from their NID hashes by generating and
 // hash-checking candidate names. See README.md for background and usage.
 //
@@ -66,8 +67,19 @@ struct Config {
     int depth = 0;
     int threads = 0;
     int device = -1;  // OpenCL GPU index, -1 = first
-    bool self_test = false, list_devices = false, help = false;
+    bool self_test = false, list_devices = false, help = false, version = false;
 };
+
+constexpr const char* NIDHUNT_VERSION = "0.1.0";
+
+// Appropriate Legal Notice (GPL-3.0 section 7b): shows the author attribution
+// that conveyed or modified versions must preserve.
+void print_version() {
+    std::printf("nidhunt %s - by Josip Parlov (parl0v)\n"
+                "https://github.com/parl0v/nidhunt\n"
+                "GPL-3.0-or-later; keep the \"nidhunt by Josip Parlov (parl0v)\" attribution (GPL section 7b).\n",
+                NIDHUNT_VERSION);
+}
 
 // Terminal styling. stdout stays plain (machine-readable HIT lines); stderr
 // carries the colored banner, live progress bar, and summary. Colors only when
@@ -144,6 +156,7 @@ void usage(const char* prog) {
         "      --device N       OpenCL GPU index to use (see --list-devices; default 0)\n"
         "      --self-test      verify the hashing against a known NID and exit\n"
         "      --list-devices   list OpenCL GPUs and exit\n"
+        "      --version        print version, author, and license, then exit\n"
         "  -h, --help\n\n"
         "A candidate name is  prefix + slot0 + slot1 + ... (+ suffix)  and a hit is\n"
         "found when first8(SHA1(name + SALT)) equals a target NID. The search stops\n"
@@ -171,6 +184,7 @@ bool parse_args(int argc, char** argv, Config& c) {
         else if (a == "--device") c.device = std::atoi(val("--device").c_str());
         else if (a == "--self-test") c.self_test = true;
         else if (a == "--list-devices") c.list_devices = true;
+        else if (a == "--version") c.version = true;
         else if (a == "-h" || a == "--help") c.help = true;
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
@@ -626,6 +640,7 @@ int main(int argc, char** argv) {
     Config c;
     if (!parse_args(argc, argv, c)) { usage(argv[0]); return 1; }
     if (c.help) { usage(argv[0]); return 0; }
+    if (c.version) { print_version(); return 0; }
     if (c.self_test) return run_self_test() ? 0 : 2;
 
     // The hashing must be correct before any search runs.

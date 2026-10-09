@@ -19,6 +19,7 @@ function Check($name, $want, $exe, $cliArgs) {
 
 Write-Host '== self-test =='
 Check 'self-test' 'self-test OK' $cpu @('--self-test')
+Check 'version attribution' 'nidhunt by Josip Parlov (parl0v)' $cpu @('--version')
 
 Write-Host '== CPU recovery =='
 Check 'cpu combinator' 'HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext' $cpu `

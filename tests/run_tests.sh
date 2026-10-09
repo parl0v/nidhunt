@@ -22,6 +22,8 @@ check() {  # check <name> <expected-substring> <command...>
 
 echo "== self-test =="
 check "self-test" "self-test OK" "$CPU" --self-test
+# The GPL section-7b attribution must appear in --version (Appropriate Legal Notice).
+check "version attribution" "nidhunt by Josip Parlov (parl0v)" "$CPU" --version
 
 echo "== CPU recovery =="
 # Combinator: reconstruct sceNpSessionSignalingCreateContext from word pieces.
