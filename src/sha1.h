@@ -16,7 +16,12 @@
 // The x86 intrinsic header must be included at global scope, before any
 // namespace: pulling it in inside a namespace would declare __m128i etc. there
 // and break its include guards for later system headers (e.g. OpenCL's).
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+//
+// Gated to x86 AND GCC/Clang: the SHA-NI path below uses GNU attributes
+// (target(), force_align) and __builtin_cpu_supports, which MSVC does not
+// provide. On MSVC (or any other compiler) nidhunt uses the portable scalar
+// SHA-1 instead.
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #define NIDHUNT_HAVE_SHANI 1
 #include <immintrin.h>
 #endif

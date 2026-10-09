@@ -44,13 +44,16 @@ def nid(name: str) -> str:
 
 # Split a symbol's trailing part into natural CamelCase / digit words.
 _WORD = re.compile(r"[A-Z][a-z0-9]+|[A-Z]+(?=[A-Z]|\b|_|\d)|[A-Z]+|\d+")
+_NID = re.compile(r"^[A-Za-z0-9+\-]{11}$")
 
 
 def split_words(name, prefix):
-    """Words of `name` after `prefix`, in order (empty if prefix doesn't match)."""
+    """Words of `name` after `prefix`, in order (empty if prefix doesn't match).
+    Underscores are separators, not terminators: tokens after an '_' (such as a
+    version tag like 0090) are kept, so nothing is silently dropped."""
     if not name.startswith(prefix):
         return []
-    return _WORD.findall(name[len(prefix):].split("_")[0])
+    return _WORD.findall(name[len(prefix):])
 
 
 def words_from(names, prefixes, rank=False):
@@ -82,8 +85,10 @@ def read_symbols(paths):
                     names.add(m.group(1))
                     continue
                 toks = line.split()
-                # "<nid> <name> ..." style (e.g. a targets/contrib file)
-                if len(toks) >= 2 and len(toks[0]) == 11:
+                # "<nid> <name> ..." style (e.g. a targets/contrib file): only
+                # when the first token is actually a valid NID, so real 11-char
+                # symbol names are not mistaken for NIDs.
+                if len(toks) >= 2 and _NID.match(toks[0]):
                     names.add(toks[1])
                 else:
                     names.add(toks[0] if toks else line)
@@ -116,7 +121,11 @@ def main():
     a = ap.parse_args()
 
     # Sanity check the implementation on every run.
-    assert nid("sceNpSessionSignalingCreateContext") == "GtuZGmN-tKw", "NID implementation mismatch"
+    # Explicit (not assert, which `python -O` strips): the NID implementation
+    # must match the known reference before the tool is trusted.
+    if nid("sceNpSessionSignalingCreateContext") != "GtuZGmN-tKw":
+        print("vocab.py: NID implementation mismatch", file=sys.stderr)
+        return 2
 
     if a.cmd == "nid":
         for n in a.names:

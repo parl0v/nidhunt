@@ -1,0 +1,2 @@
+Up36PTk687E	sceVideoOutOpen
+uquVH4-Du78	sceVideoOutClose

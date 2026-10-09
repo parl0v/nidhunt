@@ -45,8 +45,11 @@ sceNpSessionSignalingCreateContext  ->  GtuZGmN-tKw
 
 ## Building
 
-Requires a C++17 compiler. The GPU backend additionally needs an OpenCL loader
-(any GPU vendor's; the headers are bundled under `src/CL`).
+Requires a C++17 **GCC or Clang** compiler (the code uses GNU-style intrinsics
+and attributes; on Windows use MinGW-w64 GCC, not MSVC). The GPU backend
+additionally needs an OpenCL loader (any GPU vendor's; the headers are bundled
+under `src/CL`). On non-x86 or non-GNU targets it builds with a portable scalar
+SHA-1 and no SHA-NI.
 
 **Windows (MinGW / GCC):**
 
@@ -117,14 +120,20 @@ nidhunt -t targets.txt -p sce -s verbs.txt -s objects.txt -S suffixes.txt
 | `-S, --suffix FILE` | suffix list; the empty suffix is always tried too |
 | `--backend cpu\|gpu\|auto` | default `auto` (GPU if built and present, else CPU) |
 | `--threads N` | CPU worker threads (default: all cores) |
+| `--device N` | OpenCL GPU index to use (see `--list-devices`; default 0) |
 | `--self-test` | verify the hashing against the known NID and exit |
 | `--list-devices` | list OpenCL GPUs and exit |
 | `-h, --help` | usage |
 
+Candidate names longer than 100 characters are skipped (over-long vocab words
+and an over-long `--prefix` are rejected at load). Use `--vocab`/`--depth` **or**
+`--slot`, not both.
+
 ### Input file formats
 
 All three input kinds are plain text, one token per line; blank lines and lines
-starting with `#` are ignored. The same files work on both backends.
+starting with `#` are ignored; duplicate lines are dropped (keeping order). A
+path that cannot be opened is a fatal error. The same files work on both backends.
 
 * **vocab / slot** — one word per line, in natural CamelCase (`Create`,
   `Signaling`, `Context`).
@@ -138,11 +147,17 @@ See the `examples/` directory for samples.
 
 ### Output
 
-Hits go to stdout, one per line; progress and statistics go to stderr.
+Hits go to **stdout**, one per line, plain and script-friendly:
 
 ```
 HIT <nid> <name>   <annotation from the targets file, if any>
 ```
+
+Everything else — a banner, a live progress bar (percentage, candidates
+done/total, rate, elapsed, ETA, hits found, current plan), and a final summary
+that lists any **unfound** targets — goes to **stderr**, so piping stdout stays
+clean. The bar and colors appear only on a terminal; set `NO_COLOR` to disable
+colors, and redirect stderr to drop the bar entirely.
 
 ## Verifying a hit
 
@@ -207,8 +222,10 @@ The hot paths are tuned:
   the Windows watchdog).
 * **CPU** hashes in place (no per-candidate message copy), reuses the invariant
   head of the name across the innermost slot (only the tail + hash is redone),
-  and force-aligns / de-vectorizes the worker so SHA-NI runs safely on MinGW
-  threads.
+  parallelizes over the whole head space (so every thread gets work regardless
+  of which slot is largest), rejects non-matches with a one-instruction bloom
+  filter before the exact check, and force-aligns / de-vectorizes the worker so
+  SHA-NI runs safely on MinGW threads.
 * **Both** stop as soon as every target NID has been found, so searching for a
   handful of NIDs finishes the moment they turn up instead of scanning the whole
   space. Order the vocabulary with `tools/vocab.py ... --rank` to try the most

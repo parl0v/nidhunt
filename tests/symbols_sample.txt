@@ -1,0 +1,5 @@
+sceVideoOutOpen
+sceVideoOutClose
+sceVideoOutGetFlipStatus
+sceVideoOutSubmitFlip
+sceVideoOutSetFlipRate

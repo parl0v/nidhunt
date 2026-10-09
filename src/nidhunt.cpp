@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
-#include <deque>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -22,25 +24,92 @@
 
 #include "common.h"
 
+#ifdef _WIN32
+#include <io.h>
+static bool fd_is_tty(FILE* f) { return _isatty(_fileno(f)) != 0; }
+#else
+#include <unistd.h>
+static bool fd_is_tty(FILE* f) { return isatty(fileno(f)) != 0; }
+#endif
+
 #ifdef NIDHUNT_OPENCL
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
 #include "cl_kernel.h"
 #endif
 
+// The SHA-NI worker needs its stack realigned and auto-vectorization off only on
+// Windows + GCC, where std::thread stacks are not 16-byte aligned. Elsewhere
+// (Linux/macOS GCC or Clang) stacks are ABI-aligned, so these attributes are
+// unnecessary; Clang does not implement optimize() and would warn, so they are
+// gated off there.
+#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__) && (defined(__x86_64__) || defined(__i386__))
+#define NIDHUNT_WORKER_ATTR __attribute__((force_align_arg_pointer, optimize("no-tree-vectorize", "no-tree-slp-vectorize")))
+#else
+#define NIDHUNT_WORKER_ATTR
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+#define NIDHUNT_AINLINE inline __attribute__((always_inline))
+#else
+#define NIDHUNT_AINLINE inline
+#endif
+
 using namespace nidhunt;
 
 namespace {
-
-constexpr size_t MAX_NAME = 100;  // candidate length cap (name without salt)
 
 struct Config {
     std::string targets_path, vocab_path, suffix_path, prefix, backend = "auto";
     std::vector<std::string> slot_paths;
     int depth = 0;
     int threads = 0;
+    int device = -1;  // OpenCL GPU index, -1 = first
     bool self_test = false, list_devices = false, help = false;
 };
+
+// Terminal styling. stdout stays plain (machine-readable HIT lines); stderr
+// carries the colored banner, live progress bar, and summary. Colors only when
+// the stream is a TTY and NO_COLOR is unset.
+struct Ui {
+    bool out_tty = false, err_tty = false, err_color = false;
+    std::string e(const char* code) const { return err_color ? code : ""; }
+    static Ui detect() {
+        bool no = std::getenv("NO_COLOR") != nullptr;
+        Ui u;
+        u.out_tty = fd_is_tty(stdout);
+        u.err_tty = fd_is_tty(stderr);
+        u.err_color = u.err_tty && !no;
+        return u;
+    }
+};
+namespace ansi {
+constexpr const char* RST = "\033[0m"; constexpr const char* B = "\033[1m";
+constexpr const char* DIM = "\033[2m"; constexpr const char* CYAN = "\033[36m";
+constexpr const char* GRN = "\033[32m"; constexpr const char* YEL = "\033[33m";
+constexpr const char* RED = "\033[31m"; constexpr const char* GRY = "\033[90m";
+}
+
+// Human-friendly big-number and duration formatting.
+std::string human_count(double n) {
+    char b[32];
+    const char* u = "";
+    if (n >= 1e12) { n /= 1e12; u = "T"; }
+    else if (n >= 1e9) { n /= 1e9; u = "G"; }
+    else if (n >= 1e6) { n /= 1e6; u = "M"; }
+    else if (n >= 1e3) { n /= 1e3; u = "k"; }
+    std::snprintf(b, sizeof b, u[0] ? "%.2f%s" : "%.0f%s", n, u);
+    return b;
+}
+
+std::string human_time(double s) {
+    if (s < 0 || !std::isfinite(s)) s = 0;
+    int t = (int)(s + 0.5);
+    char b[24];
+    if (t >= 3600) std::snprintf(b, sizeof b, "%d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60);
+    else std::snprintf(b, sizeof b, "%d:%02d", t / 60, t % 60);
+    return b;
+}
+
 
 // Owns every word list so SlotPlan can hold stable pointers into them.
 // std::deque, not std::vector: a later add() must not invalidate the pointers
@@ -70,12 +139,16 @@ void usage(const char* prog) {
         "  -S, --suffix FILE    suffix list; the empty suffix is always included too\n"
         "      --backend B      cpu | gpu | auto   (default auto)\n"
         "      --threads N      CPU worker threads (default: all cores)\n"
+        "      --device N       OpenCL GPU index to use (see --list-devices; default 0)\n"
         "      --self-test      verify the hashing against a known NID and exit\n"
         "      --list-devices   list OpenCL GPUs and exit\n"
         "  -h, --help\n\n"
         "A candidate name is  prefix + slot0 + slot1 + ... (+ suffix)  and a hit is\n"
-        "found when first8(SHA1(name + SALT)) equals a target NID. Hits print as:\n"
-        "  HIT <nid> <name>   [annotation]\n", prog);
+        "found when first8(SHA1(name + SALT)) equals a target NID. The search stops\n"
+        "as soon as every target NID has been found. Hits print to stdout as:\n"
+        "  HIT <nid> <name>   [annotation]\n"
+        "Names longer than %d characters are skipped. Use --vocab/--depth OR --slot,\n"
+        "not both. Set NO_COLOR to disable the progress bar's colors.\n", prog, (int)MAX_NAME);
 }
 
 bool parse_args(int argc, char** argv, Config& c) {
@@ -93,6 +166,7 @@ bool parse_args(int argc, char** argv, Config& c) {
         else if (a == "-S" || a == "--suffix") c.suffix_path = val("--suffix");
         else if (a == "--backend") c.backend = val("--backend");
         else if (a == "--threads") c.threads = std::atoi(val("--threads").c_str());
+        else if (a == "--device") c.device = std::atoi(val("--device").c_str());
         else if (a == "--self-test") c.self_test = true;
         else if (a == "--list-devices") c.list_devices = true;
         else if (a == "-h" || a == "--help") c.help = true;
@@ -118,17 +192,39 @@ bool run_self_test() {
     return ok;
 }
 
-// Build the list of search plans from the config.
+// Read a word list and drop words that could never appear in a hit (longer
+// than MAX_NAME), warning how many were dropped.
+std::vector<std::string> load_words(const std::string& path, const char* what) {
+    std::vector<std::string> v = read_lines(path);
+    std::vector<std::string> keep;
+    keep.reserve(v.size());
+    size_t dropped = 0;
+    for (auto& w : v) { if (w.size() > MAX_NAME) ++dropped; else keep.push_back(std::move(w)); }
+    if (dropped)
+        std::fprintf(stderr, "nidhunt: dropped %zu %s word(s) longer than %zu chars\n",
+                     dropped, what, (size_t)MAX_NAME);
+    return keep;
+}
+
+// Build the list of search plans from the config. Fatally rejects an over-long
+// prefix and any empty slot so neither backend can hit an out-of-bounds or a
+// divide-by-zero, and so CPU and GPU always behave identically.
 std::vector<SlotPlan> build_plans(const Config& c, Corpus& corp) {
+    if (c.prefix.size() > MAX_NAME) {
+        std::fprintf(stderr, "nidhunt: --prefix is longer than the %zu-char limit\n", (size_t)MAX_NAME);
+        std::exit(1);
+    }
     std::vector<SlotPlan> plans;
     const std::vector<std::string>* suffix_slot = nullptr;
     if (!c.suffix_path.empty()) {
-        std::vector<std::string> suf = read_lines(c.suffix_path);
-        suf.insert(suf.begin(), "");  // "" = no suffix
+        std::vector<std::string> suf = load_words(c.suffix_path, "suffix");
+        suf.insert(suf.begin(), "");  // "" = no suffix (always kept, so the slot is never empty)
         suffix_slot = corp.add(std::move(suf));
     }
     if (!c.vocab_path.empty()) {  // combinator: depth sweep
-        const std::vector<std::string>* vocab = corp.add(read_lines(c.vocab_path));
+        std::vector<std::string> vv = load_words(c.vocab_path, "vocab");
+        if (vv.empty()) { std::fprintf(stderr, "nidhunt: vocab '%s' has no usable words\n", c.vocab_path.c_str()); std::exit(1); }
+        const std::vector<std::string>* vocab = corp.add(std::move(vv));
         for (int k = 1; k <= c.depth; ++k) {
             SlotPlan p;
             p.prefix = c.prefix;
@@ -139,7 +235,11 @@ std::vector<SlotPlan> build_plans(const Config& c, Corpus& corp) {
     } else {  // grammar: one plan, one slot per --slot file
         SlotPlan p;
         p.prefix = c.prefix;
-        for (auto& sp : c.slot_paths) p.slots.push_back(corp.add(read_lines(sp)));
+        for (auto& sp : c.slot_paths) {
+            std::vector<std::string> sv = load_words(sp, "slot");
+            if (sv.empty()) { std::fprintf(stderr, "nidhunt: slot '%s' has no usable words\n", sp.c_str()); std::exit(1); }
+            p.slots.push_back(corp.add(std::move(sv)));
+        }
         if (suffix_slot) p.slots.push_back(suffix_slot);
         plans.push_back(std::move(p));
     }
@@ -153,9 +253,10 @@ struct Reporter {
     const std::vector<Target>& targets;
     std::unordered_map<uint64_t, std::string> note;
     std::unordered_set<uint64_t> found;
-    std::mutex mu;
+    std::mutex mu;  // also serializes stdout hits against the stderr progress bar
     size_t hits = 0;
     std::atomic<bool> all_found{false};
+    const Ui* ui = nullptr;
     explicit Reporter(const std::vector<Target>& t) : targets(t) {
         for (auto& x : t) note[x.key] = x.note;
     }
@@ -164,165 +265,240 @@ struct Reporter {
         uint64_t key = key_of_name(name, use_ni);
         auto it = note.find(key);
         std::lock_guard<std::mutex> lk(mu);
-        if (it == note.end()) {  // GPU produced an index that the CPU disagrees with
-            std::printf("WARN %s %s  (verification mismatch)\n", nid_of_key(key).c_str(), name.c_str());
-        } else {
-            if (found.insert(key).second) ++hits;  // count each distinct target once
-            std::printf("HIT %s %s%s%s\n", nid_of_key(key).c_str(), name.c_str(),
-                        it->second.empty() ? "" : "   ", it->second.c_str());
-            if (found.size() == note.size()) all_found.store(true, std::memory_order_relaxed);
+        if (ui && ui->err_tty) { std::fprintf(stderr, "\r\033[K"); std::fflush(stderr); }  // wipe the bar
+        if (it == note.end()) {  // GPU produced an index the CPU disagrees with
+            std::fprintf(stderr, "%swarning:%s GPU/CPU verification mismatch for %s (%s)\n",
+                         ui ? ui->e(ansi::YEL).c_str() : "", ui ? ui->e(ansi::RST).c_str() : "",
+                         nid_of_key(key).c_str(), name.c_str());
+            std::fflush(stderr);
+            return;
         }
+        bool first = found.insert(key).second;
+        if (first) ++hits;
+        bool col = ui && ui->out_tty;
+        std::printf("%sHIT%s %s %s%s%s%s%s\n",
+                    col ? "\033[1;32m" : "", col ? "\033[0m" : "",
+                    nid_of_key(key).c_str(),
+                    col ? "\033[1m" : "", name.c_str(), col ? "\033[0m" : "",
+                    it->second.empty() ? "" : "   ",
+                    it->second.c_str());
         std::fflush(stdout);
+        if (found.size() == note.size()) all_found.store(true, std::memory_order_relaxed);
+    }
+};
+
+// Live progress bar on stderr: fraction, candidates done/total, rate, elapsed,
+// ETA, hits, and the current plan. Runs on its own thread; shares Reporter::mu
+// so a HIT line never interleaves with a bar redraw.
+struct Progress {
+    std::atomic<uint64_t>& done;
+    uint64_t total;
+    Reporter& rep;
+    const Ui& ui;
+    std::chrono::steady_clock::time_point t0;
+    std::atomic<int> plan_idx{0};
+    int nplans = 1;
+    std::atomic<bool> stop{false};
+    std::thread th;
+
+    Progress(std::atomic<uint64_t>& d, uint64_t tot, Reporter& r, const Ui& u,
+             std::chrono::steady_clock::time_point start, int np)
+        : done(d), total(tot), rep(r), ui(u), t0(start), nplans(np) {}
+
+    void start() { if (ui.err_tty) th = std::thread([this] { loop(); }); }
+    void loop() {
+        while (!stop.load(std::memory_order_relaxed)) {
+            render();
+            for (int i = 0; i < 12 && !stop.load(std::memory_order_relaxed); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    void render() {
+        uint64_t d = done.load(std::memory_order_relaxed);
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        double rate = el > 0 ? d / el : 0;
+        double frac = total ? (double)d / (double)total : 0;
+        if (frac > 1) frac = 1;
+        double eta = (rate > 0 && total > d) ? (double)(total - d) / rate : 0;
+        const int W = 22;
+        int fill = (int)(frac * W + 0.5);
+        if (fill > W) fill = W;
+        std::string bar;
+        for (int i = 0; i < fill; ++i) bar += "\xE2\x96\x88";       // full block
+        for (int i = fill; i < W; ++i) bar += "\xE2\x96\x91";       // light shade
+        std::string plan;
+        if (nplans > 1) {
+            char pb[32];
+            std::snprintf(pb, sizeof pb, "   %splan %d/%d%s",
+                          ui.e(ansi::GRY).c_str(), plan_idx.load() + 1, nplans, ui.e(ansi::RST).c_str());
+            plan = pb;
+        }
+        std::string doneH = human_count((double)d), totalH = human_count((double)total);
+        std::string rateH = human_count(rate), elH = human_time(el), etaH = human_time(eta);
+        std::string b = ui.e(ansi::B), rst = ui.e(ansi::RST), cyan = ui.e(ansi::CYAN);
+        std::string grn = ui.e(ansi::GRN), gry = ui.e(ansi::GRY);
+        std::string hitcol = rep.hits ? grn : gry;
+        char line[640];
+        std::snprintf(line, sizeof line,
+            "\r\033[K %s%3d%%%s %s%s%s  %s / %s  %s%s/s%s  %s%s eta %s%s  %shits %zu/%zu%s%s",
+            b.c_str(), (int)(frac * 100), rst.c_str(),
+            cyan.c_str(), bar.c_str(), rst.c_str(),
+            doneH.c_str(), totalH.c_str(),
+            grn.c_str(), rateH.c_str(), rst.c_str(),
+            gry.c_str(), elH.c_str(), etaH.c_str(), rst.c_str(),
+            hitcol.c_str(), rep.hits, rep.note.size(), rst.c_str(), plan.c_str());
+        std::lock_guard<std::mutex> lk(rep.mu);
+        std::fprintf(stderr, "%s", line);
+        std::fflush(stderr);
+    }
+    void finish() {
+        stop.store(true, std::memory_order_relaxed);
+        if (th.joinable()) th.join();
+        if (ui.err_tty) { std::fprintf(stderr, "\r\033[K"); std::fflush(stderr); }
     }
 };
 
 // --- CPU backend ------------------------------------------------------------
 
-// Everything a worker thread needs. Passed by pointer to the thread entry.
-// The last slot (fast = ns-1, when ns >= 2) is varied in the innermost loop;
-// the "head" of the name (prefix + all earlier slots) is built once and reused
-// across every word of the fast slot, so only the tail + hash is redone.
+// Appends the salt in place and hashes. always_inline so it folds into the
+// worker (which carries NIDHUNT_WORKER_ATTR): on MinGW the SHA-NI spills then
+// run on the worker's force-aligned, non-vectorized frame, with no per-call
+// overhead; elsewhere it is an ordinary inline.
+static NIDHUNT_AINLINE uint64_t nidhunt_do_hash(uint8_t* buf, size_t len, bool use_ni) {
+    std::memcpy(buf + len, SALT, 16);
+#ifdef NIDHUNT_HAVE_SHANI
+    return use_ni ? sha1_first8_inplace<true>(buf, len + 16)
+                  : sha1_first8_inplace<false>(buf, len + 16);
+#else
+    (void)use_ni;
+    return sha1_first8_inplace<false>(buf, len + 16);
+#endif
+}
+
+// Per-thread work. The search space is split by "head index": every slot except
+// the last ("fast") slot forms the head space. A thread pulls a head index,
+// builds the name head once (prefix + head words), then sweeps the fast slot's
+// words reusing that head. With one slot there is no fast slot and the head
+// space is that slot. Parallelism equals the head-space size, so threads get
+// work no matter which slot is largest.
 struct CpuJob {
     const SlotPlan* plan;
-    const std::vector<Target>* targets;
+    const std::vector<uint64_t>* keys;    // sorted target keys (binary-searched on a bloom hit)
     const std::vector<uint64_t>* weight;  // radix weight per slot
-    size_t ns, pivot, pivot_n, fast;      // fast = ns-1, or SIZE_MAX if ns == 1
+    uint64_t bloom;                       // OR of (1<<(key&63)); one-instruction reject
+    size_t ns, fast, nouter;              // fast = ns-1 (SIZE_MAX if ns==1); nouter = head slot count
+    uint64_t headspace;
     bool use_ni;
     Reporter* rep;
-    std::atomic<size_t>* next;
+    std::atomic<uint64_t>* next;
     std::atomic<uint64_t>* done;
 };
 
-// MinGW starts std::thread workers on a stack that is not 16-byte aligned, so
-// the aligned SSE that GCC emits at -O2+ (auto-vectorized buffer stores, plus
-// register spills on the SHA-NI path) faults and crashes the worker. Two
-// defenses, together, make it reliable without any special build flags:
-//   * force_align_arg_pointer realigns this frame to 16 bytes on entry, so this
-//     function and everything it calls run on an aligned stack;
-//   * no-tree-vectorize drops the aligned vectorized stores entirely.
-// The SHA-1 is hand-written intrinsics, so neither costs throughput. The main
-// thread is ABI-aligned, so the GPU path needs none of this.
-__attribute__((force_align_arg_pointer, optimize("no-tree-vectorize", "no-tree-slp-vectorize")))
+NIDHUNT_WORKER_ATTR
 static void cpu_worker(CpuJob job) {
     const SlotPlan& plan = *job.plan;
-    const std::vector<Target>& targets = *job.targets;
+    const std::vector<uint64_t>& keys = *job.keys;
+    const uint64_t bloom = job.bloom;
     const std::vector<uint64_t>& weight = *job.weight;
-    const size_t ns = job.ns, pivot = job.pivot, pivot_n = job.pivot_n, fast = job.fast;
+    const size_t fast = job.fast, nouter = job.nouter;
+    const uint64_t headspace = job.headspace;
     const bool use_ni = job.use_ni;
-    const size_t nt = targets.size();
     alignas(16) uint8_t buf[256];  // name + salt + SHA-1 padding, hashed in place
     const size_t plen = plan.prefix.size();
-    std::memcpy(buf, plan.prefix.data(), plen);  // prefix is constant for the plan
+    std::memcpy(buf, plan.prefix.data(), plen);  // prefix is validated <= MAX_NAME
     std::atomic<bool>& all_found = job.rep->all_found;
 
-    // always_inline: this must fold into cpu_worker so the SHA-NI code runs on
-    // cpu_worker's force-aligned frame. A non-inlined lambda would carry none
-    // of the worker's attributes and could fault on MinGW's misaligned stack.
-    auto hash_match = [&](size_t len, uint64_t idx) __attribute__((always_inline)) {
-        if (len > MAX_NAME) return;
-        std::memcpy(buf + len, SALT, 16);
-#ifdef NIDHUNT_HAVE_SHANI
-        uint64_t key = use_ni ? sha1_first8_inplace<true>(buf, len + 16)
-                              : sha1_first8_inplace<false>(buf, len + 16);
-#else
-        uint64_t key = sha1_first8_inplace<false>(buf, len + 16);
-#endif
-        for (size_t t = 0; t < nt; ++t)
-            if (key == targets[t].key) { job.rep->report(plan, idx, use_ni); break; }
-    };
+    const std::vector<std::string>* fastwords = (fast == (size_t)-1) ? nullptr : plan.slots[fast];
+    const size_t fastn = fastwords ? fastwords->size() : 1;
 
-    std::vector<size_t> dig(ns, 0);
     for (;;) {
         if (all_found.load(std::memory_order_relaxed)) break;  // every target found
-        size_t pv = job.next->fetch_add(1);
-        if (pv >= pivot_n) break;
-        for (size_t j = 0; j < ns; ++j) dig[j] = 0;
-        dig[pivot] = pv;
-        uint64_t local = 0;
+        uint64_t h = job.next->fetch_add(1);
+        if (h >= headspace) break;
 
-        if (fast == (size_t)-1) {  // ns == 1: nothing to reuse, just hash the word
-            const std::string& word = (*plan.slots[pivot])[pv];
-            std::memcpy(buf + plen, word.data(), word.size());
-            hash_match(plen + word.size(), (uint64_t)pv * weight[pivot]);
-            *job.done += 1;
-            continue;
+        // Decode h into the head slots (slot 0 fastest) and build the head.
+        size_t head = plen;
+        uint64_t head_idx = 0;
+        bool toolong = false;
+        uint64_t rem = h;
+        for (size_t j = 0; j < nouter; ++j) {
+            const std::vector<std::string>& s = *plan.slots[j];
+            size_t d = (size_t)(rem % s.size());
+            rem /= s.size();
+            head_idx += (uint64_t)d * weight[j];
+            const std::string& wrd = s[d];
+            if (head + wrd.size() > MAX_NAME) { toolong = true; break; }  // skip, never OOB
+            std::memcpy(buf + head, wrd.data(), wrd.size());
+            head += wrd.size();
         }
 
-        const std::vector<std::string>& fastwords = *plan.slots[fast];
-        const size_t fastn = fastwords.size();
-        for (;;) {
-            // Build the head (prefix + every slot except the fast one) once, then
-            // reuse it across all fast-slot words.
-            size_t head = plen;
-            uint64_t head_idx = 0;
-            for (size_t j = 0; j < fast; ++j) {
-                const std::string& word = (*plan.slots[j])[dig[j]];
-                std::memcpy(buf + head, word.data(), word.size());
-                head += word.size();
-                head_idx += (uint64_t)dig[j] * weight[j];
-            }
-            if (head <= MAX_NAME) {
+        uint64_t local = fastn;  // every head covers fastn candidates (counted even if skipped)
+        if (!toolong) {
+            if (!fastwords) {  // ns == 1
+                uint64_t key = nidhunt_do_hash(buf, head, use_ni);
+                if (((bloom >> (key & 63)) & 1) && std::binary_search(keys.begin(), keys.end(), key)) job.rep->report(plan, head_idx, use_ni);
+            } else {
                 for (size_t fd = 0; fd < fastn; ++fd) {
-                    const std::string& fw = fastwords[fd];
+                    const std::string& fw = (*fastwords)[fd];
+                    if (head + fw.size() > MAX_NAME) continue;  // skip, do not truncate (GPU parity)
                     std::memcpy(buf + head, fw.data(), fw.size());
-                    hash_match(head + fw.size(), head_idx + (uint64_t)fd * weight[fast]);
+                    uint64_t key = nidhunt_do_hash(buf, head + fw.size(), use_ni);
+                    if (((bloom >> (key & 63)) & 1) && std::binary_search(keys.begin(), keys.end(), key)) job.rep->report(plan, head_idx + (uint64_t)fd * weight[fast], use_ni);
+                    if ((fd & 0x3FF) == 0x3FF && all_found.load(std::memory_order_relaxed)) break;
                 }
             }
-            local += fastn;
-            if (all_found.load(std::memory_order_relaxed)) break;
-            // Odometer over every slot except the pivot and the fast slot.
-            size_t pos = 0;
-            while (pos < ns) {
-                if (pos == pivot || pos == fast) { ++pos; continue; }
-                if (++dig[pos] < plan.slots[pos]->size()) break;
-                dig[pos] = 0; ++pos;
-            }
-            if (pos >= ns) break;
         }
         *job.done += local;
     }
 }
 
-void hash_plan_cpu(const SlotPlan& plan, const std::vector<Target>& targets, int threads,
+void hash_plan_cpu(const SlotPlan& plan, const std::vector<uint64_t>& keys, int threads,
                    bool use_ni, Reporter& rep, std::atomic<uint64_t>& done) {
     size_t ns = plan.slots.size();
     if (ns == 0) return;
-    // Vary the last slot innermost (fast); parallelize over the largest of the
-    // remaining slots for load balance. With one slot there is no head to reuse.
     size_t fast = ns >= 2 ? ns - 1 : (size_t)-1;
-    size_t pivot = 0;
-    size_t pivot_hi = (ns >= 2) ? ns - 1 : ns;  // candidates for pivot: [0, pivot_hi)
-    for (size_t j = 1; j < pivot_hi; ++j)
-        if (plan.slots[j]->size() > plan.slots[pivot]->size()) pivot = j;
-    size_t pivot_n = plan.slots[pivot]->size();
+    size_t nouter = (fast == (size_t)-1) ? 1 : fast;  // head slots = [0, nouter)
 
-    // Radix weight of each slot: turns a local digit vector into the global
-    // candidate index that name_at() expects.
+    // Radix weight of each slot: turns digit values into the global candidate
+    // index that name_at() expects.
     std::vector<uint64_t> weight(ns);
     uint64_t w = 1;
     for (size_t j = 0; j < ns; ++j) { weight[j] = w; w *= (uint64_t)plan.slots[j]->size(); }
 
-    std::atomic<size_t> next{0};
-    CpuJob job{&plan, &targets, &weight, ns, pivot, pivot_n, fast, use_ni, &rep, &next, &done};
+    uint64_t headspace = 1;
+    for (size_t j = 0; j < nouter; ++j) headspace *= (uint64_t)plan.slots[j]->size();
+
+    uint64_t bloom = 0;
+    for (uint64_t k : keys) bloom |= (uint64_t)1 << (k & 63);
+
+    std::atomic<uint64_t> next{0};
+    CpuJob job{&plan, &keys, &weight, bloom, ns, fast, nouter, headspace, use_ni, &rep, &next, &done};
     std::vector<std::thread> pool;
-    for (int i = 0; i < threads; ++i) pool.emplace_back(cpu_worker, job);
+    int n = threads < 1 ? 1 : threads;
+    for (int i = 0; i < n; ++i) pool.emplace_back(cpu_worker, job);
     for (auto& t : pool) t.join();
 }
 
 // --- GPU backend ------------------------------------------------------------
 #ifdef NIDHUNT_OPENCL
 
-cl_device_id pick_gpu(bool list) {
+// Enumerate GPUs across platforms in a stable order. With list=true, print
+// them with a global index. Returns the device at global index `want` (or the
+// first if want < 0), nullptr if none / out of range.
+cl_device_id pick_gpu(bool list, int want) {
     cl_platform_id plats[16]; cl_uint np = 0;
     clGetPlatformIDs(16, plats, &np);
     cl_device_id chosen = nullptr;
+    int gi = 0;
     for (cl_uint i = 0; i < np; ++i) {
         cl_device_id devs[16]; cl_uint nd = 0;
         clGetDeviceIDs(plats[i], CL_DEVICE_TYPE_GPU, 16, devs, &nd);
-        for (cl_uint j = 0; j < nd; ++j) {
-            char name[256] = {0}; clGetDeviceInfo(devs[j], CL_DEVICE_NAME, sizeof name, name, nullptr);
-            if (list) std::fprintf(stderr, "  platform %u device %u: %s\n", i, j, name);
-            if (!chosen) chosen = devs[j];
+        for (cl_uint j = 0; j < nd; ++j, ++gi) {
+            if (list) {
+                char name[256] = {0}; clGetDeviceInfo(devs[j], CL_DEVICE_NAME, sizeof name, name, nullptr);
+                std::fprintf(stderr, "  [%d] %s\n", gi, name);
+            }
+            if (want < 0 ? (chosen == nullptr) : (gi == want)) chosen = devs[j];
         }
     }
     return chosen;
@@ -374,7 +550,7 @@ void hash_plan_gpu(GpuCtx& g, const SlotPlan& plan, const std::vector<Target>& t
     std::vector<uint8_t> pf(plan.prefix.begin(), plan.prefix.end()); if (pf.empty()) pf.push_back(0);
 
     // Kernel specialized to this plan's slot counts and prefix length.
-    cl_kernel kern = gpu_kernel_for(g, nidhunt_build_kernel(slotsig, (uint32_t)plan.prefix.size()));
+    cl_kernel kern = gpu_kernel_for(g, nidhunt_build_kernel(slotsig, (uint32_t)plan.prefix.size(), (uint32_t)MAX_NAME));
 
     cl_int err;
     auto mk = [&](const void* p, size_t n, cl_mem_flags f) {
@@ -392,15 +568,15 @@ void hash_plan_gpu(GpuCtx& g, const SlotPlan& plan, const std::vector<Target>& t
     uint32_t nt = (uint32_t)tkeys.size();
     uint64_t total = plan.count();
     // Args that do not change across batches.
-    clSetKernelArg(kern, 0, sizeof(cl_mem), &bwc);
-    clSetKernelArg(kern, 1, sizeof(cl_mem), &bwo);
-    clSetKernelArg(kern, 2, sizeof(cl_mem), &bwl);
-    clSetKernelArg(kern, 3, sizeof(cl_mem), &bpf);
-    clSetKernelArg(kern, 5, 8, &total);
-    clSetKernelArg(kern, 6, sizeof(cl_mem), &btg);
-    clSetKernelArg(kern, 7, 4, &nt);
-    clSetKernelArg(kern, 8, sizeof(cl_mem), &bhits);
-    clSetKernelArg(kern, 9, sizeof(cl_mem), &bn);
+    CK(clSetKernelArg(kern, 0, sizeof(cl_mem), &bwc));
+    CK(clSetKernelArg(kern, 1, sizeof(cl_mem), &bwo));
+    CK(clSetKernelArg(kern, 2, sizeof(cl_mem), &bwl));
+    CK(clSetKernelArg(kern, 3, sizeof(cl_mem), &bpf));
+    CK(clSetKernelArg(kern, 5, 8, &total));
+    CK(clSetKernelArg(kern, 6, sizeof(cl_mem), &btg));
+    CK(clSetKernelArg(kern, 7, 4, &nt));
+    CK(clSetKernelArg(kern, 8, sizeof(cl_mem), &bhits));
+    CK(clSetKernelArg(kern, 9, sizeof(cl_mem), &bn));
 
     // Keep several batches in flight to hide the read-back latency, but force a
     // sync every INFLIGHT batches so no single GPU-busy window gets long enough
@@ -415,6 +591,8 @@ void hash_plan_gpu(GpuCtx& g, const SlotPlan& plan, const std::vector<Target>& t
         uint32_t nh = 0;
         CK(clEnqueueReadBuffer(g.q, bn, CL_TRUE, 0, 4, &nh, 0, nullptr, nullptr));
         if (nh) {
+            if (nh > 1024)
+                std::fprintf(stderr, "nidhunt: warning: %u matches this window, only the first 1024 reported\n", nh);
             uint32_t ncopy = nh < 1024 ? nh : 1024;
             CK(clEnqueueReadBuffer(g.q, bhits, CL_TRUE, 0, 8 * ncopy, hitbuf.data(), 0, nullptr, nullptr));
             for (uint32_t i = 0; i < ncopy; ++i) rep.report(plan, hitbuf[i], false);
@@ -424,7 +602,7 @@ void hash_plan_gpu(GpuCtx& g, const SlotPlan& plan, const std::vector<Target>& t
     };
     for (uint64_t base = 0; base < total; base += BATCH) {
         uint64_t n = total - base < BATCH ? total - base : BATCH;
-        clSetKernelArg(kern, 4, 8, &base);
+        CK(clSetKernelArg(kern, 4, 8, &base));
         size_t gsz = (size_t)((n + 255) / 256 * 256);
         CK(clEnqueueNDRangeKernel(g.q, kern, 1, nullptr, &gsz, nullptr, 0, nullptr, nullptr));
         done += n;
@@ -460,23 +638,33 @@ int main(int argc, char** argv) {
 #endif
 
     if (c.targets_path.empty() && !c.list_devices) { std::fprintf(stderr, "no --targets given\n\n"); usage(argv[0]); return 1; }
-    if (!c.vocab_path.empty() && c.slot_paths.empty() && c.depth <= 0) { std::fprintf(stderr, "--vocab needs --depth > 0\n"); return 1; }
+    if (!c.vocab_path.empty() && !c.slot_paths.empty()) { std::fprintf(stderr, "give either --vocab/--depth or --slot, not both\n"); return 1; }
+    if (!c.vocab_path.empty() && c.depth <= 0) { std::fprintf(stderr, "--vocab needs --depth > 0\n"); return 1; }
     if (c.vocab_path.empty() && c.slot_paths.empty() && !c.list_devices) { std::fprintf(stderr, "give either --vocab/--depth or --slot\n"); return 1; }
 
     int threads = c.threads > 0 ? c.threads : (int)std::thread::hardware_concurrency();
     if (threads < 1) threads = 1;
-    bool use_ni = shani_available();
+    if (threads > 1024) { std::fprintf(stderr, "nidhunt: clamping --threads to 1024\n"); threads = 1024; }
+    // NIDHUNT_NO_NI forces the portable scalar SHA-1 even where SHA-NI exists
+    // (lets the scalar path be tested, and is a fallback if SHA-NI misbehaves).
+    bool use_ni = shani_available() && std::getenv("NIDHUNT_NO_NI") == nullptr;
+    Ui ui = Ui::detect();
 
 #ifdef NIDHUNT_OPENCL
     GpuCtx gpu{};
     char dname[256] = "GPU";
     if (want_gpu || c.list_devices) {
         if (c.list_devices) std::fprintf(stderr, "OpenCL GPUs:\n");
-        cl_device_id dev = pick_gpu(c.list_devices);
+        cl_device_id dev = pick_gpu(c.list_devices, c.list_devices ? -1 : c.device);
         if (c.list_devices) return dev ? 0 : 1;
         if (!dev) {
-            if (c.backend == "gpu") { std::fprintf(stderr, "no OpenCL GPU found\n"); return 3; }
+            if (c.backend == "gpu") {
+                std::fprintf(stderr, c.device >= 0 ? "no OpenCL GPU at index %d (see --list-devices)\n"
+                                                    : "no OpenCL GPU found\n", c.device);
+                return 3;
+            }
             want_gpu = false;  // auto: fall back to CPU
+            std::fprintf(stderr, "nidhunt: no OpenCL GPU; using CPU\n");
         } else {
             clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof dname, dname, nullptr);
             cl_int err;
@@ -491,31 +679,75 @@ int main(int argc, char** argv) {
 #endif
 
     std::vector<Target> targets = read_targets(c.targets_path);
-    if (targets.empty()) { std::fprintf(stderr, "no valid NIDs in %s\n", c.targets_path.c_str()); return 1; }
+    if (targets.empty()) { std::fprintf(stderr, "nidhunt: no valid NIDs in %s\n", c.targets_path.c_str()); return 1; }
     Corpus corp;
     std::vector<SlotPlan> plans = build_plans(c, corp);
 
-    uint64_t grand = 0; for (auto& p : plans) grand += p.count();
+    // Total candidate count, with overflow detection (a space > 2^64 can't be
+    // enumerated as a linear index).
+    uint64_t grand = 0; bool overflow = false;
+    for (auto& p : plans) {
+        uint64_t cnt = p.count();
+        if (cnt == UINT64_MAX || __builtin_add_overflow(grand, cnt, &grand)) overflow = true;
+    }
+    if (overflow) {
+        std::fprintf(stderr, "nidhunt: search space exceeds 2^64; narrow it (smaller vocab or lower depth)\n");
+        return 1;
+    }
+
+    std::unordered_set<uint64_t> target_keys;
+    for (auto& t : targets) target_keys.insert(t.key);
+    const size_t ntargets = target_keys.size();  // distinct NIDs
+    std::vector<uint64_t> target_key_vec(target_keys.begin(), target_keys.end());
+    std::sort(target_key_vec.begin(), target_key_vec.end());  // for the CPU binary search
+
     std::string label;
 #ifdef NIDHUNT_OPENCL
-    if (want_gpu) label = std::string("gpu (") + dname + ")";
+    if (want_gpu) label = std::string("GPU ") + dname;
 #endif
-    if (label.empty()) label = use_ni ? "cpu (sha-ni)" : "cpu (scalar)";
-    std::fprintf(stderr, "backend=%s targets=%zu plans=%zu candidates=%.3e\n",
-                 label.c_str(), targets.size(), plans.size(), (double)grand);
+    if (label.empty())
+        label = (use_ni ? "CPU SHA-NI x" : "CPU scalar x") + std::to_string(threads);
+
+    // Banner (stderr).
+    std::fprintf(stderr, "%s%snidhunt%s  %s%s%s\n",
+                 ui.e(ansi::B).c_str(), ui.e(ansi::CYAN).c_str(), ui.e(ansi::RST).c_str(),
+                 ui.e(ansi::DIM).c_str(), label.c_str(), ui.e(ansi::RST).c_str());
+    std::fprintf(stderr, "%stargets%s %zu   %splans%s %zu   %sspace%s %s candidates\n\n",
+                 ui.e(ansi::GRY).c_str(), ui.e(ansi::RST).c_str(), ntargets,
+                 ui.e(ansi::GRY).c_str(), ui.e(ansi::RST).c_str(), plans.size(),
+                 ui.e(ansi::GRY).c_str(), ui.e(ansi::RST).c_str(), human_count((double)grand).c_str());
 
     Reporter rep(targets);
+    rep.ui = &ui;
     std::atomic<uint64_t> done{0};
     auto t0 = std::chrono::steady_clock::now();
-    for (auto& p : plans) {
+    Progress prog(done, grand, rep, ui, t0, (int)plans.size());
+    prog.start();
+    for (size_t pi = 0; pi < plans.size(); ++pi) {
         if (rep.all_found.load(std::memory_order_relaxed)) break;  // all targets found
+        prog.plan_idx.store((int)pi, std::memory_order_relaxed);
 #ifdef NIDHUNT_OPENCL
-        if (want_gpu) { hash_plan_gpu(gpu, p, targets, rep, done); continue; }
+        if (want_gpu) { hash_plan_gpu(gpu, plans[pi], targets, rep, done); continue; }
 #endif
-        hash_plan_cpu(p, targets, threads, use_ni, rep, done);
+        hash_plan_cpu(plans[pi], target_key_vec, threads, use_ni, rep, done);
     }
+    prog.finish();
     double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::fprintf(stderr, "done: %.3e hashes in %.1fs = %.1f M/s, %zu hit(s)\n",
-                 (double)done.load(), dt, done.load() / (dt > 0 ? dt : 1e-9) / 1e6, rep.hits);
+
+    // Summary (stderr).
+    double rate = dt > 0 ? done.load() / dt : 0;
+    const char* found_col = rep.hits == ntargets ? ui.e(ansi::GRN).c_str() : ui.e(ansi::YEL).c_str();
+    std::fprintf(stderr, "%sdone%s  %s hashed in %s \xC2\xB7 %s/s \xC2\xB7 %s%zu/%zu%s targets found\n",
+                 ui.e(ansi::B).c_str(), ui.e(ansi::RST).c_str(),
+                 human_count((double)done.load()).c_str(), human_time(dt).c_str(), human_count(rate).c_str(),
+                 found_col, rep.hits, ntargets, ui.e(ansi::RST).c_str());
+    if (rep.hits < ntargets) {
+        std::string un;
+        std::unordered_set<uint64_t> shown;
+        for (auto& t : targets)
+            if (!rep.found.count(t.key) && shown.insert(t.key).second) { un += un.empty() ? "" : " "; un += t.nid; }
+        if (!un.empty())
+            std::fprintf(stderr, "%sunfound%s %s\n", ui.e(ansi::GRY).c_str(), ui.e(ansi::RST).c_str(), un.c_str());
+    }
     return 0;
 }

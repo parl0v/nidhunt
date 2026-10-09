@@ -11,8 +11,9 @@
 // wlen) is sliced into slots by [start, start+count). A candidate index decodes
 // mixed-radix (slot 0 fastest-varying) to one word per slot; the name is
 // prefix + words, SALT is appended and SHA1'd, and the first 8 digest bytes
-// (big-endian) are compared with the target keys. The decode is identical to
-// the CPU path, so every GPU hit is re-hashed and checked on the host.
+// (big-endian) are compared with the target keys. Candidates whose name would
+// exceed MAX_NAME are skipped (not truncated) exactly as on the CPU, so the two
+// backends enumerate the identical space; every GPU hit is re-hashed on the host.
 #ifndef NIDHUNT_CL_KERNEL_H
 #define NIDHUNT_CL_KERNEL_H
 
@@ -20,6 +21,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "common.h"
 
 // SHA-1 block transform and the fixed head of the kernel.
 static const char* NIDHUNT_KERNEL_PRELUDE = R"CLC(
@@ -42,38 +45,13 @@ void sha1_block(uint* h, const uint* m) {
 }
 )CLC";
 
-// Everything after the name is built: append salt, pad, hash, compare.
-static const char* NIDHUNT_KERNEL_TAIL = R"CLC(
-    for (int i = 0; i < 16; ++i) buf[len + i] = SALT[i];
-    uint L = len + 16;
-    uint nb = (L + 9 <= 64) ? 1 : 2;
-    uint end = nb * 64;
-    buf[L] = 0x80;
-    for (uint i = L + 1; i < end - 8; ++i) buf[i] = 0;  // zero only the padding gap
-    ulong bits = (ulong)L * 8;
-    for (int i = 0; i < 8; ++i) buf[end - 1 - i] = (uchar)(bits >> (8 * i));
-    uint h[5] = {0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u};
-    uint m[16];
-    for (uint blk = 0; blk < nb; ++blk) {
-        for (int i = 0; i < 16; ++i) {
-            uint p = blk * 64 + i * 4;
-            m[i] = ((uint)buf[p] << 24) | ((uint)buf[p + 1] << 16) | ((uint)buf[p + 2] << 8) | buf[p + 3];
-        }
-        sha1_block(h, m);
-    }
-    ulong key = ((ulong)h[0] << 32) | h[1];
-    for (uint t = 0; t < ntargets; ++t) {
-        if (key == targets[t]) {
-            uint slot = atomic_inc(nhits);
-            if (slot < 1024) hits[slot] = gid;
-        }
-    }
-}
-)CLC";
-
 // Build a crack kernel specialized to one plan: slots is {count, start} per
-// slot (slot 0 fastest-varying), plen is the prefix length.
-inline std::string nidhunt_build_kernel(const std::vector<std::pair<uint32_t, uint32_t>>& slots, uint32_t plen) {
+// slot (slot 0 fastest-varying), plen is the prefix length. maxname is the
+// candidate length cap (common.h MAX_NAME); the private buffer is sized for
+// maxname + 16 salt + SHA-1 padding (<= 128 for maxname <= 103).
+inline std::string nidhunt_build_kernel(const std::vector<std::pair<uint32_t, uint32_t>>& slots,
+                                        uint32_t plen, uint32_t maxname) {
+    char line[256];
     std::string s = NIDHUNT_KERNEL_PRELUDE;
     s += "__kernel void crack(__global const uchar* wchars, __global const uint* woff, __global const uchar* wlen,\n"
          "                    __constant uchar* prefix, ulong base, ulong total,\n"
@@ -81,10 +59,12 @@ inline std::string nidhunt_build_kernel(const std::vector<std::pair<uint32_t, ui
          "    ulong gid = base + get_global_id(0);\n"
          "    if (gid >= total) return;\n"
          "    uchar buf[128];\n"
-         "    uint len = 0;\n";
-    char line[256];
-    for (uint32_t i = 0; i < plen; ++i) {  // prefix bytes (unrolled)
-        std::snprintf(line, sizeof line, "    buf[len++] = prefix[%u];\n", i);
+         "    uint len = 0, toolong = 0;\n";
+    std::snprintf(line, sizeof line, "    const uint MAXNAME = %uu;\n", maxname);
+    s += line;
+    for (uint32_t i = 0; i < plen; ++i) {  // prefix bytes (unrolled), bounded
+        std::snprintf(line, sizeof line,
+            "    if (len < MAXNAME) buf[len++] = prefix[%u]; else toolong = 1;\n", i);
         s += line;
     }
     s += "    ulong idx = gid;\n    uint wi, o, l;\n";
@@ -96,10 +76,38 @@ inline std::string nidhunt_build_kernel(const std::vector<std::pair<uint32_t, ui
             std::snprintf(line, sizeof line, "    wi = %uu + (uint)idx;\n", start);
         }
         s += line;
+        // Copy the word, but never past MAXNAME; mark toolong if it does not fit
+        // (so the candidate is skipped, matching the CPU — not truncated).
         s += "    o = woff[wi]; l = wlen[wi];\n"
-             "    for (uint i = 0; i < l && len < 100; ++i) buf[len++] = wchars[o + i];\n";
+             "    for (uint i = 0; i < l; ++i) { if (len < MAXNAME) buf[len++] = wchars[o + i]; else toolong = 1; }\n";
     }
-    s += NIDHUNT_KERNEL_TAIL;
+    s += "    if (!toolong) {\n"
+         "        for (int i = 0; i < 16; ++i) buf[len + i] = SALT[i];\n"
+         "        uint L = len + 16;\n"
+         "        uint nb = (L + 9 <= 64) ? 1 : 2;\n"
+         "        uint end = nb * 64;\n"
+         "        buf[L] = 0x80;\n"
+         "        for (uint i = L + 1; i < end - 8; ++i) buf[i] = 0;\n"
+         "        ulong bits = (ulong)L * 8;\n"
+         "        for (int i = 0; i < 8; ++i) buf[end - 1 - i] = (uchar)(bits >> (8 * i));\n"
+         "        uint h[5] = {0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u};\n"
+         "        uint m[16];\n"
+         "        for (uint blk = 0; blk < nb; ++blk) {\n"
+         "            for (int i = 0; i < 16; ++i) {\n"
+         "                uint p = blk * 64 + i * 4;\n"
+         "                m[i] = ((uint)buf[p] << 24) | ((uint)buf[p + 1] << 16) | ((uint)buf[p + 2] << 8) | buf[p + 3];\n"
+         "            }\n"
+         "            sha1_block(h, m);\n"
+         "        }\n"
+         "        ulong key = ((ulong)h[0] << 32) | h[1];\n"
+         "        for (uint t = 0; t < ntargets; ++t) {\n"
+         "            if (key == targets[t]) {\n"
+         "                uint slot = atomic_inc(nhits);\n"
+         "                if (slot < 1024) hits[slot] = gid;\n"
+         "            }\n"
+         "        }\n"
+         "    }\n"
+         "}\n";
     return s;
 }
 

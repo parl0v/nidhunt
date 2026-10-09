@@ -27,6 +27,18 @@ Check 'cpu grammar' 'HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext' $cpu `
     @('-t','tests/targets_selftest.txt','-s','tests/slot_selftest.txt')
 Check 'cpu suffix' 'HIT 23LRUSvYu1M sceAgcInit_0090' $cpu `
     @('-t','tests/targets_suffix.txt','-p','sceAgc','-s','tests/vocab_suffix.txt','-S','tests/suffixes_suffix.txt')
+Check 'cpu two-block' 'HIT XOUAK95mhQ0' $cpu `
+    @('-t','tests/targets_twoblock.txt','-s','tests/slot_twoblock.txt')
+$env:NIDHUNT_NO_NI = '1'
+Check 'cpu scalar' 'HIT GtuZGmN-tKw sceNpSessionSignalingCreateContext' $cpu `
+    @('-t','tests/targets_selftest.txt','-p','sceNp','-v','tests/vocab_selftest.txt','-d','4')
+Remove-Item Env:\NIDHUNT_NO_NI
+
+Write-Host '== input validation =='
+$out = (& $cpu @('-t','tests/targets_selftest.txt','-s','tests/slot_selftest.txt','-s','tests/empty.txt') 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0 -and $out -match 'no usable words') {
+    Write-Host 'ok   - empty slot rejected'; $script:pass++
+} else { Write-Host 'FAIL - empty slot rejected'; $script:fail++ }
 
 if (Test-Path $gpu) {
     Write-Host '== GPU recovery =='
@@ -34,6 +46,13 @@ if (Test-Path $gpu) {
         @('--backend','gpu','-t','tests/targets_selftest.txt','-p','sceNp','-v','tests/vocab_selftest.txt','-d','4')
     Check 'gpu suffix' 'HIT 23LRUSvYu1M sceAgcInit_0090' $gpu `
         @('--backend','gpu','-t','tests/targets_suffix.txt','-p','sceAgc','-s','tests/vocab_suffix.txt','-S','tests/suffixes_suffix.txt')
+    Check 'gpu two-block' 'HIT XOUAK95mhQ0' $gpu `
+        @('--backend','gpu','-t','tests/targets_twoblock.txt','-s','tests/slot_twoblock.txt')
+    Write-Host '== CPU/GPU parity =='
+    $pc = (& $cpu @('-t','tests/targets_parity.txt','-p','sceVideoOut','-v','tests/vocab_parity.txt','-d','1') 2>$null | Select-String '^HIT' | Sort-Object | Out-String)
+    $pg = (& $gpu @('--backend','gpu','-t','tests/targets_parity.txt','-p','sceVideoOut','-v','tests/vocab_parity.txt','-d','1') 2>$null | Select-String '^HIT' | Sort-Object | Out-String)
+    if ($pc.Trim() -and $pc -eq $pg) { Write-Host 'ok   - cpu/gpu parity'; $script:pass++ }
+    else { Write-Host 'FAIL - cpu/gpu parity'; $script:fail++ }
 } else {
     Write-Host "(skip GPU tests: $gpu not built)"
 }
@@ -48,6 +67,10 @@ if ($py) {
     Write-Host '== vocab.py =='
     Check 'vocab nid' 'GtuZGmN-tKw' $py @('tools/vocab.py','nid','sceNpSessionSignalingCreateContext')
     Check 'vocab check' 'OK GtuZGmN-tKw' $py @('tools/vocab.py','check','sceNpSessionSignalingCreateContext','GtuZGmN-tKw')
+    Check 'vocab rank' 'Out' $py @('tools/vocab.py','words','--symbols','tests/symbols_sample.txt','--prefix','sce','--rank')
+    & $py @('tools/vocab.py','positions','--symbols','tests/symbols_sample.txt','--prefix','sceVideoOut','--out',"$env:TEMP\nh_pos") 2>&1 | Out-Null
+    if (Test-Path "$env:TEMP\nh_pos_1.txt") { Write-Host 'ok   - vocab positions'; $script:pass++ }
+    else { Write-Host 'FAIL - vocab positions'; $script:fail++ }
 } else {
     Write-Host '(skip vocab.py tests: no working python)'
 }
