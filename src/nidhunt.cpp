@@ -29,10 +29,29 @@
 
 #ifdef _WIN32
 #include <io.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 static bool fd_is_tty(FILE* f) { return _isatty(_fileno(f)) != 0; }
+// Turn on ANSI escape handling for this stream's console (off by default in the
+// legacy conhost). Returns true only if the console then understands VT, so the
+// caller can fall back to plain output instead of printing raw escape codes.
+static bool enable_vt(FILE* f) {
+    HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD mode = 0;
+    if (!GetConsoleMode(h, &mode)) return false;
+    if (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) return true;
+    return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+}
 #else
 #include <unistd.h>
 static bool fd_is_tty(FILE* f) { return isatty(fileno(f)) != 0; }
+static bool enable_vt(FILE*) { return true; }
 #endif
 
 #ifdef NIDHUNT_OPENCL
@@ -90,8 +109,10 @@ struct Ui {
     static Ui detect() {
         bool no = std::getenv("NO_COLOR") != nullptr;
         Ui u;
-        u.out_tty = fd_is_tty(stdout);
-        u.err_tty = fd_is_tty(stderr);
+        // Drive ANSI (progress bar + color) only when the stream is a console
+        // and VT processing is on; otherwise stay plain so no escape codes leak.
+        u.out_tty = fd_is_tty(stdout) && enable_vt(stdout);
+        u.err_tty = fd_is_tty(stderr) && enable_vt(stderr);
         u.err_color = u.err_tty && !no;
         return u;
     }
@@ -111,7 +132,7 @@ std::string human_count(double n) {
     else if (n >= 1e9) { n /= 1e9; u = "G"; }
     else if (n >= 1e6) { n /= 1e6; u = "M"; }
     else if (n >= 1e3) { n /= 1e3; u = "k"; }
-    std::snprintf(b, sizeof b, u[0] ? "%.2f%s" : "%.0f%s", n, u);
+    std::snprintf(b, sizeof b, u[0] ? "%.1f%s" : "%.0f%s", n, u);
     return b;
 }
 
@@ -336,16 +357,17 @@ struct Progress {
         double frac = total ? (double)d / (double)total : 0;
         if (frac > 1) frac = 1;
         double eta = (rate > 0 && total > d) ? (double)(total - d) / rate : 0;
-        const int W = 22;
+        const int W = 12;
         int fill = (int)(frac * W + 0.5);
         if (fill > W) fill = W;
-        std::string bar;
-        for (int i = 0; i < fill; ++i) bar += "\xE2\x96\x88";       // full block
-        for (int i = fill; i < W; ++i) bar += "\xE2\x96\x91";       // light shade
+        std::string bar = "[";
+        for (int i = 0; i < fill; ++i) bar += '#';          // ASCII: renders on any console
+        for (int i = fill; i < W; ++i) bar += '-';
+        bar += "]";
         std::string plan;
         if (nplans > 1) {
-            char pb[32];
-            std::snprintf(pb, sizeof pb, "   %splan %d/%d%s",
+            char pb[48];
+            std::snprintf(pb, sizeof pb, " %sp%d/%d%s",
                           ui.e(ansi::GRY).c_str(), plan_idx.load() + 1, nplans, ui.e(ansi::RST).c_str());
             plan = pb;
         }
@@ -354,9 +376,11 @@ struct Progress {
         std::string b = ui.e(ansi::B), rst = ui.e(ansi::RST), cyan = ui.e(ansi::CYAN);
         std::string grn = ui.e(ansi::GRN), gry = ui.e(ansi::GRY);
         std::string hitcol = rep.hits ? grn : gry;
+        // One compact line (~60 visible chars) so it never wraps; \r\033[K
+        // rewinds and clears it each tick, updating in place.
         char line[640];
         std::snprintf(line, sizeof line,
-            "\r\033[K %s%3d%%%s %s%s%s  %s / %s  %s%s/s%s  %s%s eta %s%s  %shits %zu/%zu%s%s",
+            "\r\033[K %s%3d%%%s %s%s%s %s/%s %s%s/s%s %s%s>%s%s %s%zu/%zu%s%s",
             b.c_str(), (int)(frac * 100), rst.c_str(),
             cyan.c_str(), bar.c_str(), rst.c_str(),
             doneH.c_str(), totalH.c_str(),
@@ -754,7 +778,7 @@ int main(int argc, char** argv) {
     // Summary (stderr).
     double rate = dt > 0 ? done.load() / dt : 0;
     const char* found_col = rep.hits == ntargets ? ui.e(ansi::GRN).c_str() : ui.e(ansi::YEL).c_str();
-    std::fprintf(stderr, "%sdone%s  %s hashed in %s \xC2\xB7 %s/s \xC2\xB7 %s%zu/%zu%s targets found\n",
+    std::fprintf(stderr, "%sdone%s  %s hashed in %s - %s/s - %s%zu/%zu%s targets found\n",
                  ui.e(ansi::B).c_str(), ui.e(ansi::RST).c_str(),
                  human_count((double)done.load()).c_str(), human_time(dt).c_str(), human_count(rate).c_str(),
                  found_col, rep.hits, ntargets, ui.e(ansi::RST).c_str());
