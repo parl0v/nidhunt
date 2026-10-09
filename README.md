@@ -21,7 +21,11 @@ to those projects with confidence. Results so far:
 * `HV4j+E0MBHE` = `sceAgcCreateInterpolantMapping_0100`, **merged** into AnyPS5
   ([#2319](https://github.com/boykopovar/AnyPS5/pull/2319)).
 * `zARR5aCmkoY` = `sceAgcDcbAtomicGds_0900`, submitted to
-  [sce_symbols #22](https://github.com/zecoxao/sce_symbols/pull/22).
+  [sce_symbols #22](https://github.com/zecoxao/sce_symbols/pull/22)
+  ([commit](https://github.com/zecoxao/sce_symbols/pull/22/commits/645f9c2), 2026-10-09).
+* `X+4jdIS75P0` = `sceAudioInIsPadEmbeddedMic` (imported by PPSA21564), submitted to
+  [sce_symbols #22](https://github.com/zecoxao/sce_symbols/pull/22)
+  ([commit](https://github.com/zecoxao/sce_symbols/pull/22/commits/300761b), 2026-10-10).
 
 nidhunt only hashes **function names**. It does not touch keys, passwords, or
 copy protection, and ships with no symbol data — you supply your own word lists
