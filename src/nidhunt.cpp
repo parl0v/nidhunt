@@ -291,15 +291,39 @@ cl_device_id pick_gpu(bool list) {
 
 #define CK(x) do { cl_int e_ = (x); if (e_ != CL_SUCCESS) { std::fprintf(stderr, "OpenCL error %d at %s:%d\n", e_, __FILE__, __LINE__); std::exit(3); } } while (0)
 
-void hash_plan_gpu(cl_context ctx, cl_command_queue q, cl_kernel kern,
-                   const SlotPlan& plan, const std::vector<Target>& targets,
+// Device state plus a cache of kernels keyed by generated source, so plans that
+// share a shape (same slot counts and prefix length) compile only once.
+struct GpuCtx {
+    cl_context ctx;
+    cl_command_queue q;
+    cl_device_id dev;
+    std::unordered_map<std::string, cl_kernel> cache;
+};
+
+cl_kernel gpu_kernel_for(GpuCtx& g, const std::string& src) {
+    auto it = g.cache.find(src);
+    if (it != g.cache.end()) return it->second;
+    cl_int err;
+    const char* csrc = src.c_str();
+    cl_program prog = clCreateProgramWithSource(g.ctx, 1, &csrc, nullptr, &err); CK(err);
+    if (clBuildProgram(prog, 1, &g.dev, "-cl-std=CL1.2", nullptr, nullptr) != CL_SUCCESS) {
+        char log[16384] = {0};
+        clGetProgramBuildInfo(prog, g.dev, CL_PROGRAM_BUILD_LOG, sizeof log, log, nullptr);
+        std::fprintf(stderr, "kernel build failed:\n%s\n", log);
+        std::exit(3);
+    }
+    cl_kernel k = clCreateKernel(prog, "crack", &err); CK(err);
+    g.cache[src] = k;
+    return k;
+}
+
+void hash_plan_gpu(GpuCtx& g, const SlotPlan& plan, const std::vector<Target>& targets,
                    Reporter& rep, std::atomic<uint64_t>& done) {
-    // Flatten every slot's words into one pool; slotStart/slotCount slice it.
+    // Flatten every slot's words into one pool; each slot is [start, start+count).
     std::vector<uint8_t> wchars; std::vector<uint32_t> woff; std::vector<uint8_t> wlen;
-    std::vector<uint32_t> slotStart, slotCount;
+    std::vector<std::pair<uint32_t, uint32_t>> slotsig;  // {count, start} per slot
     for (auto* s : plan.slots) {
-        slotStart.push_back((uint32_t)woff.size());
-        slotCount.push_back((uint32_t)s->size());
+        slotsig.push_back({(uint32_t)s->size(), (uint32_t)woff.size()});
         for (auto& word : *s) {
             woff.push_back((uint32_t)wchars.size());
             wlen.push_back((uint8_t)word.size());
@@ -310,58 +334,67 @@ void hash_plan_gpu(cl_context ctx, cl_command_queue q, cl_kernel kern,
     std::vector<uint64_t> tkeys; for (auto& t : targets) tkeys.push_back(t.key);
     std::vector<uint8_t> pf(plan.prefix.begin(), plan.prefix.end()); if (pf.empty()) pf.push_back(0);
 
+    // Kernel specialized to this plan's slot counts and prefix length.
+    cl_kernel kern = gpu_kernel_for(g, nidhunt_build_kernel(slotsig, (uint32_t)plan.prefix.size()));
+
     cl_int err;
     auto mk = [&](const void* p, size_t n, cl_mem_flags f) {
-        cl_mem m = clCreateBuffer(ctx, f | CL_MEM_COPY_HOST_PTR, n ? n : 1, const_cast<void*>(p), &err); CK(err); return m;
+        cl_mem m = clCreateBuffer(g.ctx, f | CL_MEM_COPY_HOST_PTR, n ? n : 1, const_cast<void*>(p), &err); CK(err); return m;
     };
     cl_mem bwc = mk(wchars.data(), wchars.size(), CL_MEM_READ_ONLY);
     cl_mem bwo = mk(woff.data(), woff.size() * 4, CL_MEM_READ_ONLY);
     cl_mem bwl = mk(wlen.data(), wlen.size(), CL_MEM_READ_ONLY);
-    cl_mem bss = mk(slotStart.data(), slotStart.size() * 4, CL_MEM_READ_ONLY);
-    cl_mem bsc = mk(slotCount.data(), slotCount.size() * 4, CL_MEM_READ_ONLY);
     cl_mem bpf = mk(pf.data(), pf.size(), CL_MEM_READ_ONLY);
     cl_mem btg = mk(tkeys.data(), tkeys.size() * 8, CL_MEM_READ_ONLY);
     std::vector<uint64_t> hitbuf(1024, 0); uint32_t zero = 0;
     cl_mem bhits = mk(hitbuf.data(), hitbuf.size() * 8, CL_MEM_READ_WRITE);
     cl_mem bn = mk(&zero, 4, CL_MEM_READ_WRITE);
 
-    uint32_t nslots = (uint32_t)plan.slots.size(), plen = (uint32_t)plan.prefix.size(), nt = (uint32_t)tkeys.size();
+    uint32_t nt = (uint32_t)tkeys.size();
     uint64_t total = plan.count();
+    // Args that do not change across batches.
+    clSetKernelArg(kern, 0, sizeof(cl_mem), &bwc);
+    clSetKernelArg(kern, 1, sizeof(cl_mem), &bwo);
+    clSetKernelArg(kern, 2, sizeof(cl_mem), &bwl);
+    clSetKernelArg(kern, 3, sizeof(cl_mem), &bpf);
+    clSetKernelArg(kern, 5, 8, &total);
+    clSetKernelArg(kern, 6, sizeof(cl_mem), &btg);
+    clSetKernelArg(kern, 7, 4, &nt);
+    clSetKernelArg(kern, 8, sizeof(cl_mem), &bhits);
+    clSetKernelArg(kern, 9, sizeof(cl_mem), &bn);
+
+    // Keep several batches in flight to hide the read-back latency, but force a
+    // sync every INFLIGHT batches so no single GPU-busy window gets long enough
+    // to trip the Windows GPU watchdog (TDR). The hit counter accrues across
+    // the plan and is drained at each sync point.
+    uint32_t zero2 = 0;
     const size_t BATCH = (size_t)1 << 26;
-    for (uint64_t base = 0; base < total; base += BATCH) {
-        uint64_t n = total - base < BATCH ? total - base : BATCH;
-        int a = 0;
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &bwc);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &bwo);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &bwl);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &bss);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &bsc);
-        clSetKernelArg(kern, a++, 4, &nslots);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &bpf);
-        clSetKernelArg(kern, a++, 4, &plen);
-        clSetKernelArg(kern, a++, 8, &base);
-        clSetKernelArg(kern, a++, 8, &total);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &btg);
-        clSetKernelArg(kern, a++, 4, &nt);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &bhits);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &bn);
-        size_t gsz = (size_t)((n + 255) / 256 * 256);
-        CK(clEnqueueNDRangeKernel(q, kern, 1, nullptr, &gsz, nullptr, 0, nullptr, nullptr));
+    const int INFLIGHT = 8;
+    int pending = 0;
+    auto drain = [&]() {
+        CK(clFinish(g.q));
         uint32_t nh = 0;
-        CK(clEnqueueReadBuffer(q, bn, CL_TRUE, 0, 4, &nh, 0, nullptr, nullptr));
+        CK(clEnqueueReadBuffer(g.q, bn, CL_TRUE, 0, 4, &nh, 0, nullptr, nullptr));
         if (nh) {
             uint32_t ncopy = nh < 1024 ? nh : 1024;
-            CK(clEnqueueReadBuffer(q, bhits, CL_TRUE, 0, 8 * ncopy, hitbuf.data(), 0, nullptr, nullptr));
+            CK(clEnqueueReadBuffer(g.q, bhits, CL_TRUE, 0, 8 * ncopy, hitbuf.data(), 0, nullptr, nullptr));
             for (uint32_t i = 0; i < ncopy; ++i) rep.report(plan, hitbuf[i], false);
-            CK(clEnqueueWriteBuffer(q, bn, CL_TRUE, 0, 4, &zero, 0, nullptr, nullptr));
+            CK(clEnqueueWriteBuffer(g.q, bn, CL_TRUE, 0, 4, &zero2, 0, nullptr, nullptr));
         }
+        pending = 0;
+    };
+    for (uint64_t base = 0; base < total; base += BATCH) {
+        uint64_t n = total - base < BATCH ? total - base : BATCH;
+        clSetKernelArg(kern, 4, 8, &base);
+        size_t gsz = (size_t)((n + 255) / 256 * 256);
+        CK(clEnqueueNDRangeKernel(g.q, kern, 1, nullptr, &gsz, nullptr, 0, nullptr, nullptr));
         done += n;
+        if (++pending >= INFLIGHT) drain();
     }
-    // NOTE: buffers are intentionally not released here. Some OpenCL ICDs
-    // (notably NVIDIA on Windows) fault during teardown; the OS reclaims every
-    // buffer at process exit anyway, and a run hashes a fixed set of plans and
-    // then exits, so there is nothing to leak into.
-    (void)bwc; (void)bwo; (void)bwl; (void)bss; (void)bsc; (void)bpf; (void)btg; (void)bhits; (void)bn;
+    if (pending) drain();
+    // Buffers are intentionally not released: some ICDs (notably NVIDIA on
+    // Windows) fault during teardown, and the OS reclaims everything at exit.
+    for (cl_mem m : {bwc, bwo, bwl, bpf, btg, bhits, bn}) (void)m;
 }
 #endif  // NIDHUNT_OPENCL
 
@@ -393,7 +426,7 @@ int main(int argc, char** argv) {
     bool use_ni = shani_available();
 
 #ifdef NIDHUNT_OPENCL
-    cl_context ctx = nullptr; cl_command_queue q = nullptr; cl_kernel kern = nullptr;
+    GpuCtx gpu{};
     char dname[256] = "GPU";
     if (want_gpu || c.list_devices) {
         if (c.list_devices) std::fprintf(stderr, "OpenCL GPUs:\n");
@@ -405,14 +438,10 @@ int main(int argc, char** argv) {
         } else {
             clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof dname, dname, nullptr);
             cl_int err;
-            ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err); CK(err);
-            q = clCreateCommandQueue(ctx, dev, 0, &err); CK(err);
-            cl_program prog = clCreateProgramWithSource(ctx, 1, &NIDHUNT_KERNEL, nullptr, &err); CK(err);
-            if (clBuildProgram(prog, 1, &dev, "-cl-std=CL1.2", nullptr, nullptr) != CL_SUCCESS) {
-                char log[16384] = {0}; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, sizeof log, log, nullptr);
-                std::fprintf(stderr, "kernel build failed:\n%s\n", log); return 3;
-            }
-            kern = clCreateKernel(prog, "crack", &err); CK(err);
+            gpu.dev = dev;
+            gpu.ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err); CK(err);
+            gpu.q = clCreateCommandQueue(gpu.ctx, dev, 0, &err); CK(err);
+            // Kernels are compiled lazily per plan shape (see gpu_kernel_for).
         }
     }
 #else
@@ -438,7 +467,7 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     for (auto& p : plans) {
 #ifdef NIDHUNT_OPENCL
-        if (want_gpu) { hash_plan_gpu(ctx, q, kern, p, targets, rep, done); continue; }
+        if (want_gpu) { hash_plan_gpu(gpu, p, targets, rep, done); continue; }
 #endif
         hash_plan_cpu(p, targets, threads, use_ni, rep, done);
     }
